@@ -172,7 +172,32 @@ if __name__ == "__main__":
 
 
 def install():
-    """Install apply_patch script to /usr/local/bin/."""
-    APPLY_PATCH_PATH.parent.mkdir(parents=True, exist_ok=True)
-    APPLY_PATCH_PATH.write_text(APPLY_PATCH_CODE, encoding="utf-8")
-    APPLY_PATCH_PATH.chmod(0o755)
+    """Install apply_patch script. Tries /usr/local/bin/ first, falls back to ~/.local/bin/."""
+    import os
+    import sys
+
+    paths_to_try = [
+        pathlib.Path("/usr/local/bin/apply_patch"),
+        pathlib.Path.home() / ".local" / "bin" / "apply_patch",
+    ]
+
+    installed_path = None
+    for p in paths_to_try:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(APPLY_PATCH_CODE, encoding="utf-8")
+            p.chmod(0o755)
+            installed_path = p
+            break
+        except PermissionError:
+            continue
+
+    if installed_path is None:
+        sys.stderr.write("apply_patch: could not install to any writable path\n")
+        return
+
+    # Ensure the install dir is in PATH so the tool can be found
+    install_dir = str(installed_path.parent)
+    current_path = os.environ.get("PATH", "")
+    if install_dir not in current_path.split(":"):
+        os.environ["PATH"] = install_dir + ":" + current_path
