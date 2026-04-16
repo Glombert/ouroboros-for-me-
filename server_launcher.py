@@ -51,16 +51,40 @@ except ImportError:
     log.info(f"Loaded .env via manual parser: {_env_file}")
 
 # ----------------------------
-# 0.1) Install launcher deps
+# 0.1) Bootstrap virtualenv (Ubuntu PEP668-safe)
 # ----------------------------
-def install_launcher_deps() -> None:
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "--user",
-         "openai>=1.0.0", "requests"],
-        check=True,
-    )
+_VENV_DIR = pathlib.Path.home() / ".ouroboros_venv"
 
-install_launcher_deps()
+def _bootstrap_venv() -> None:
+    """Create venv if needed and re-exec inside it (PEP668 workaround)."""
+    in_venv = (sys.prefix != sys.base_prefix) or str(_VENV_DIR) in sys.prefix
+    if in_venv:
+        # Already inside our venv — ensure minimal deps
+        _pip = _VENV_DIR / "bin" / "pip"
+        if _pip.exists():
+            subprocess.run(
+                [str(_pip), "install", "-q",
+                 "openai>=1.0.0", "requests", "python-dotenv"],
+                check=False,
+            )
+        return
+
+    # Not in venv — create it if needed, then re-exec
+    if not (_VENV_DIR / "bin" / "python").exists():
+        log.info(f"Creating virtualenv at {_VENV_DIR}")
+        subprocess.run([sys.executable, "-m", "venv", str(_VENV_DIR)], check=True)
+        # Bootstrap minimal deps
+        subprocess.run(
+            [str(_VENV_DIR / "bin" / "pip"), "install", "-q",
+             "openai>=1.0.0", "requests", "python-dotenv"],
+            check=True,
+        )
+
+    venv_python = str(_VENV_DIR / "bin" / "python")
+    log.info(f"Re-execing under venv: {venv_python}")
+    os.execv(venv_python, [venv_python] + sys.argv)
+
+_bootstrap_venv()
 
 def ensure_claude_code_cli() -> bool:
     """Best-effort install of Claude Code CLI for Anthropic-powered code edits."""
@@ -101,6 +125,18 @@ _REPO_DIR_ENV = os.environ.get("OUROBOROS_REPO_DIR", str(pathlib.Path.home() / "
 REPO_DIR = pathlib.Path(_REPO_DIR_ENV).expanduser().resolve()
 if str(REPO_DIR) not in sys.path:
     sys.path.insert(0, str(REPO_DIR))
+
+# Install repo requirements into venv (we are inside venv at this point)
+def _install_repo_requirements() -> None:
+    req_file = REPO_DIR / "requirements.txt"
+    if not req_file.exists():
+        return
+    _pip = _VENV_DIR / "bin" / "pip"
+    if not _pip.exists():
+        _pip = pathlib.Path(sys.executable).parent / "pip"
+    subprocess.run([str(_pip), "install", "-q", "-r", str(req_file)], check=False)
+
+_install_repo_requirements()
 
 from ouroboros.apply_patch import install as install_apply_patch
 from ouroboros.llm import DEFAULT_LIGHT_MODEL
