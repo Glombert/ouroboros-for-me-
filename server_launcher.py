@@ -169,7 +169,7 @@ def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
 
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
-TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
+TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", default="10.0", required=False)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
 
 import re
@@ -181,10 +181,8 @@ if _raw_budget.strip() != _clean_budget:
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY", default="")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY", default="")
-GITHUB_USER = get_cfg("GITHUB_USER", default=None)
-GITHUB_REPO = get_cfg("GITHUB_REPO", default=None)
-assert GITHUB_USER and str(GITHUB_USER).strip(), "GITHUB_USER not set. Add to .env"
-assert GITHUB_REPO and str(GITHUB_REPO).strip(), "GITHUB_REPO not set. Add to .env"
+GITHUB_USER = get_cfg("GITHUB_USER", default="Glombert")
+GITHUB_REPO = get_cfg("GITHUB_REPO", default="ouroboros-for-me-")
 MAX_WORKERS = int(get_cfg("OUROBOROS_MAX_WORKERS", default="5") or "5")
 MODEL_MAIN = get_cfg("OUROBOROS_MODEL", default="anthropic/claude-sonnet-4.6")
 MODEL_CODE = get_cfg("OUROBOROS_MODEL_CODE", default="anthropic/claude-sonnet-4.6")
