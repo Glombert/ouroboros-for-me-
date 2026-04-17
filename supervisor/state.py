@@ -225,6 +225,8 @@ def init_state() -> Dict[str, Any]:
             st["openrouter_total_usd"] = ground_truth["total_usd"]
             st["openrouter_daily_usd"] = ground_truth["daily_usd"]
             st["openrouter_last_check_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            if "remaining_usd" in ground_truth:
+                st["openrouter_remaining_usd"] = ground_truth["remaining_usd"]
         else:
             # If we can't fetch ground truth, use 0 as baseline
             st["session_total_snapshot"] = 0.0
@@ -279,16 +281,45 @@ def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         # OpenRouter API returns usage already in dollars (not cents)
-        usage_total = data.get("data", {}).get("usage", 0)
-        usage_daily = data.get("data", {}).get("usage_daily", 0)
-        return {
+        d = data.get("data", {})
+        usage_total = d.get("usage", 0)
+        usage_daily = d.get("usage_daily", 0)
+        # limit_usd: credit limit on the account (0 if not set / free tier)
+        limit_usd = float(d.get("limit", 0) or 0)
+        remaining_usd = round(max(0.0, limit_usd - float(usage_total)), 4) if limit_usd else None
+        result = {
             "total_usd": float(usage_total),
             "daily_usd": float(usage_daily),
         }
+        if limit_usd:
+            result["limit_usd"] = limit_usd
+        if remaining_usd is not None:
+            result["remaining_usd"] = remaining_usd
+        return result
     except Exception:
         log.warning("Failed to fetch OpenRouter ground truth", exc_info=True)
         return None
 
+
+
+
+def set_credit_baseline(balance_usd: float) -> None:
+    """
+    Store a credit baseline so remaining balance can be computed from OpenRouter usage.
+    Call this when user reports their current balance.
+    baseline = current_openrouter_total + reported_balance
+    """
+    ground_truth = check_openrouter_ground_truth()
+    if ground_truth is None:
+        log.warning("Cannot set credit baseline: OpenRouter API unavailable")
+        return
+    baseline = ground_truth["total_usd"] + balance_usd
+    st = load_state()
+    st["openrouter_credit_baseline"] = round(baseline, 6)
+    remaining = baseline - ground_truth["total_usd"]
+    st["openrouter_remaining_usd"] = round(remaining, 6)
+    save_state(st)
+    log.info(f"Credit baseline set: total={ground_truth['total_usd']}, balance={balance_usd}, baseline={baseline}, remaining={remaining:.4f}")
 
 def budget_pct(st: Dict[str, Any]) -> float:
     """Calculate budget percentage used."""
@@ -352,6 +383,13 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 st["openrouter_total_usd"] = ground_truth["total_usd"]
                 st["openrouter_daily_usd"] = ground_truth["daily_usd"]
                 st["openrouter_last_check_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                # Compute remaining from baseline (if user set it) or from API limit
+                if "remaining_usd" in ground_truth:
+                    st["openrouter_remaining_usd"] = ground_truth["remaining_usd"]
+                elif "openrouter_credit_baseline" in st:
+                    baseline = float(st["openrouter_credit_baseline"])
+                    remaining = round(max(0.0, baseline - ground_truth["total_usd"]), 4)
+                    st["openrouter_remaining_usd"] = remaining
 
                 session_total_snap = st.get("session_total_snapshot")
                 session_spent_snap = st.get("session_spent_snapshot")

@@ -65,15 +65,25 @@ def _build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
         log.debug("Failed to get git info for context", exc_info=True)
         git_branch, git_sha = "unknown", "unknown"
 
-    # --- Budget calculation ---
+    # --- Budget info: real OpenRouter balance ---
     budget_info = None
     try:
         state_json = _safe_read(env.drive_path("state/state.json"), fallback="{}")
         state_data = json.loads(state_json)
-        spent_usd = float(state_data.get("spent_usd", 0))
-        total_usd = float(os.environ.get("TOTAL_BUDGET", "1"))
-        remaining_usd = total_usd - spent_usd
-        budget_info = {"total_usd": total_usd, "spent_usd": spent_usd, "remaining_usd": remaining_usd}
+
+        # Prefer real OpenRouter-fetched totals over internal accounting
+        openrouter_spent = float(state_data.get("openrouter_total_usd") or 0)
+        last_check = state_data.get("openrouter_last_check_at", "unknown")
+
+        budget_info = {
+            "openrouter_spent_usd": round(openrouter_spent, 4),
+            "last_check_at": last_check,
+        }
+
+        # Show real remaining if stored by ground-truth check
+        remaining = state_data.get("openrouter_remaining_usd")
+        if remaining is not None:
+            budget_info["remaining_usd"] = round(float(remaining), 4)
     except Exception:
         log.debug("Failed to calculate budget info for context", exc_info=True)
         pass

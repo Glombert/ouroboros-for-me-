@@ -94,6 +94,7 @@ OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
 TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
+OPENROUTER_CREDIT_LIMIT = get_secret("OPENROUTER_CREDIT_LIMIT", default="")
 
 # Robust TOTAL_BUDGET parsing — handles \r\n, spaces, and other junk from Colab Secrets
 # Example: user enters "8 800" → Colab stores as "8\r\n800" → we need 8800
@@ -139,6 +140,8 @@ os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
 os.environ["GITHUB_REPO"] = str(GITHUB_REPO)
 os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "anthropic/claude-sonnet-4.6")
+if OPENROUTER_CREDIT_LIMIT:
+    os.environ["OPENROUTER_CREDIT_LIMIT"] = str(OPENROUTER_CREDIT_LIMIT)
 os.environ["OUROBOROS_MODEL_CODE"] = str(MODEL_CODE or "anthropic/claude-sonnet-4.6")
 if MODEL_LIGHT:
     os.environ["OUROBOROS_MODEL_LIGHT"] = str(MODEL_LIGHT)
@@ -441,6 +444,20 @@ def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
         state_str = "ON" if turn_on else "OFF"
         send_with_budget(chat_id, f"🧬 Evolution: {state_str}")
         return f"[Supervisor handled /evolve — evolution toggled {state_str}]\n"
+
+    if lowered.startswith("/balance") or lowered.startswith("/set_balance"):
+        parts = stripped.split()
+        if len(parts) < 2:
+            send_with_budget(chat_id, "Usage: /balance 9.74 (current balance on OpenRouter)")
+        else:
+            try:
+                balance = float(parts[1])
+                from supervisor.state import set_credit_baseline
+                set_credit_baseline(balance)
+                send_with_budget(chat_id, f"✅ Balance set: ${balance:.2f} remaining on OpenRouter")
+            except ValueError:
+                send_with_budget(chat_id, "❌ Invalid number")
+        return "[Supervisor handled /balance]\n"
 
     if lowered.startswith("/bg"):
         parts = lowered.split()
