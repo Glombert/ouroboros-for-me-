@@ -19,34 +19,35 @@ class AutonomousLoop:
         self.tasks_file = tasks_file
         self.interval = interval
         self.tasks: List[Dict] = []
-        self._load_tasks()
 
-    def _load_tasks(self):
-        """Загрузить задачи из файла."""
+    async def load_tasks(self) -> None:
+        """Загружает задачи из файла."""
         try:
             with open(self.tasks_file, "r") as f:
                 self.tasks = json.load(f)
+            logger.info(f"Loaded {len(self.tasks)} tasks from {self.tasks_file}")
         except FileNotFoundError:
-            logger.warning(f"Файл задач {self.tasks_file} не найден. Создан новый.")
-            self.tasks = []
+            logger.warning(f"Tasks file {self.tasks_file} not found. Starting with empty task list.")
         except json.JSONDecodeError:
-            logger.error(f"Ошибка чтения файла задач {self.tasks_file}. Файл повреждён.")
-            self.tasks = []
+            logger.error(f"Invalid JSON in {self.tasks_file}. Starting with empty task list.")
 
-    def _save_tasks(self):
-        """Сохранить задачи в файл."""
+    async def save_tasks(self) -> None:
+        """Сохраняет задачи в файл."""
         with open(self.tasks_file, "w") as f:
             json.dump(self.tasks, f, indent=2)
+        logger.info(f"Saved {len(self.tasks)} tasks to {self.tasks_file}")
 
-    async def run(self):
-        """Запустить автономный цикл."""
+    async def run(self) -> None:
+        """Запускает автономный цикл."""
+        await self.load_tasks()
         while True:
-            logger.info(f"Проверка задач... (осталось: {len(self.tasks)})")
-            if self.tasks:
-                task = self.tasks.pop(0)
-                logger.info(f"Выполнение задачи: {task.get('description', 'Без описания')}")
-                # Здесь будет вызов инструментов для выполнения задачи
-                self._save_tasks()
+            logger.info("Checking for tasks...")
+            for task in self.tasks:
+                if not task.get("completed", False):
+                    logger.info(f"Executing task: {task.get('description', 'No description')}")
+                    # Здесь будет логика выполнения задачи
+                    task["completed"] = True
+            await self.save_tasks()
             await asyncio.sleep(self.interval)
 
 if __name__ == "__main__":
