@@ -102,6 +102,152 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
         return {}
 
 
+
+
+# ─────────────────────────────────────────────────────────
+# Google AI Studio fallback (uses OpenAI-compatible API)
+# ─────────────────────────────────────────────────────────
+# Uses the OpenAI-compatible endpoint:
+# https://generativelanguage.googleapis.com/v1beta/openai/
+# No extra SDK needed — just openai library.
+# Model name mapping: OpenRouter model -> Google model name
+
+GOOGLE_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+GOOGLE_MODEL_MAP: Dict[str, str] = {
+    "anthropic/claude-sonnet-4.6": "gemini-2.0-flash",
+    "anthropic/claude-opus-4.6": "gemini-2.5-pro-preview-05-06",
+    "openai/gpt-4o": "gemini-2.0-flash",
+    "openai/gpt-4o-mini": "gemini-2.0-flash-lite",
+    "google/gemini-2.5-flash": "gemini-2.5-flash-preview-04-17",
+    "google/gemini-2.5-pro": "gemini-2.5-pro-preview-05-06",
+    "google/gemini-2.0-flash": "gemini-2.0-flash",
+}
+
+
+def _map_to_google_model(openrouter_model: str) -> str:
+    """Map OpenRouter model name to Google AI Studio model name."""
+    if openrouter_model in GOOGLE_MODEL_MAP:
+        return GOOGLE_MODEL_MAP[openrouter_model]
+    # If it already looks like a Google model, use as-is
+    if openrouter_model.startswith("gemini"):
+        return openrouter_model
+    # Extract model family from openrouter format (provider/model)
+    if "/" in openrouter_model:
+        _, model_part = openrouter_model.split("/", 1)
+        # Try to match by model family
+        for key, val in GOOGLE_MODEL_MAP.items():
+            if model_part.split("-")[0] in key:
+                return val
+    return "gemini-2.0-flash"  # safe default
+
+
+_google_client_cache = None
+
+
+def get_google_client() -> Optional["GoogleAIClient"]:
+    """Return cached GoogleAIClient instance, or None if unavailable."""
+    global _google_client_cache
+    if _google_client_cache is not None:
+        return _google_client_cache
+    api_key = os.environ.get("GOOGLE_AI_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        _google_client_cache = GoogleAIClient(api_key=api_key)
+        return _google_client_cache
+    except Exception as e:
+        log.warning(f"Could not create GoogleAIClient: {e}")
+        return None
+
+
+class GoogleAIClient:
+    """
+    Google AI Studio fallback using OpenAI-compatible API.
+    Uses https://generativelanguage.googleapis.com/v1beta/openai/
+    No special SDK required — works via openai library.
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("GOOGLE_AI_API_KEY", "")
+        if not self._api_key:
+            raise RuntimeError("GOOGLE_AI_API_KEY not set")
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI(
+                base_url=GOOGLE_OPENAI_BASE,
+                api_key=self._api_key,
+            )
+        return self._client
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 8192,
+        tool_choice: str = "auto",
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Chat via Google AI Studio OpenAI-compatible API."""
+        client = self._get_client()
+        google_model = _map_to_google_model(model)
+
+        # Clean messages: Google doesn't support cache_control, clean it out
+        clean_messages = []
+        for m in messages:
+            cm = {k: v for k, v in m.items() if k != "cache_control"}
+            if isinstance(cm.get("content"), list):
+                # Clean cache_control from content blocks too
+                new_content = []
+                for block in cm["content"]:
+                    if isinstance(block, dict):
+                        new_content.append({k: v for k, v in block.items() if k != "cache_control"})
+                    else:
+                        new_content.append(block)
+                cm["content"] = new_content
+            clean_messages.append(cm)
+
+        # Clean tools too
+        clean_tools = None
+        if tools:
+            clean_tools = []
+            for t in tools:
+                ct = {k: v for k, v in t.items() if k != "cache_control"}
+                clean_tools.append(ct)
+
+        kwargs: Dict[str, Any] = {
+            "model": google_model,
+            "messages": clean_messages,
+            "max_tokens": min(max_tokens, 8192),  # Google free tier limit
+        }
+        if clean_tools:
+            kwargs["tools"] = clean_tools
+            kwargs["tool_choice"] = tool_choice
+
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                log.warning("Google AI Studio quota exhausted")
+            raise
+
+        resp_dict = resp.model_dump()
+        choices = resp_dict.get("choices") or [{}]
+        msg = (choices[0] if choices else {}).get("message") or {}
+        usage = resp_dict.get("usage") or {}
+        # Google doesn't return cost, set to 0 (it's free)
+        usage["cost"] = 0.0
+        usage["provider"] = "google_ai_studio"
+
+        log.info(f"GoogleAIClient: {google_model} -> tokens in={usage.get('prompt_tokens',0)} out={usage.get('completion_tokens',0)}")
+        return msg, usage
+
+
 class LLMClient:
     """OpenRouter API wrapper. All LLM calls go through this class."""
 
@@ -193,7 +339,24 @@ class LLMClient:
             kwargs["tools"] = tools_with_cache
             kwargs["tool_choice"] = tool_choice
 
-        resp = client.chat.completions.create(**kwargs)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as openrouter_err:
+            google_cl = get_google_client()
+            if google_cl is not None:
+                log.warning(f"OpenRouter failed ({openrouter_err}), falling back to Google AI Studio")
+                try:
+                    return google_cl.chat(
+                        messages=messages,
+                        model=model,
+                        tools=tools,
+                        reasoning_effort=reasoning_effort,
+                        max_tokens=max_tokens,
+                        tool_choice=tool_choice,
+                    )
+                except Exception as google_err:
+                    log.error(f"Google AI Studio fallback also failed: {google_err}")
+            raise openrouter_err
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
         choices = resp_dict.get("choices") or [{}]
