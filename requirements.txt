@@ -3,3 +3,4 @@ requests
 playwright
 playwright-stealth
 google-genai>=1.0.0
+anthropic>=0.90.0

@@ -141,6 +141,272 @@ def _map_to_google_model(openrouter_model: str) -> str:
                 return val
     return "gemini-2.0-flash"  # safe default
 
+# ─────────────────────────────────────────────────────────
+# Anthropic Direct API client (no OpenRouter middleman)
+# ─────────────────────────────────────────────────────────
+ANTHROPIC_MODEL_MAP: Dict[str, str] = {
+    "anthropic/claude-sonnet-4.6": "claude-sonnet-4-5",
+    "anthropic/claude-opus-4.6": "claude-opus-4-5",
+    "anthropic/claude-3-5-sonnet": "claude-3-5-sonnet-20241022",
+    "anthropic/claude-3-5-haiku": "claude-3-5-haiku-20241022",
+    "anthropic/claude-3-haiku": "claude-3-haiku-20240307",
+    "anthropic/claude-opus-4": "claude-opus-4-5",
+    "anthropic/claude-sonnet-4": "claude-sonnet-4-5",
+}
+
+_anthropic_client_cache = None
+
+
+def get_anthropic_client() -> Optional["AnthropicDirectClient"]:
+    """Return cached AnthropicDirectClient instance, or None if unavailable."""
+    global _anthropic_client_cache
+    if _anthropic_client_cache is not None:
+        return _anthropic_client_cache
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        _anthropic_client_cache = AnthropicDirectClient(api_key=api_key)
+        return _anthropic_client_cache
+    except Exception as e:
+        log.warning(f"Could not create AnthropicDirectClient: {e}")
+        return None
+
+
+def _map_to_anthropic_model(openrouter_model: str) -> str:
+    """Map OpenRouter model name to native Anthropic model ID."""
+    if openrouter_model in ANTHROPIC_MODEL_MAP:
+        return ANTHROPIC_MODEL_MAP[openrouter_model]
+    if openrouter_model.startswith("claude-"):
+        return openrouter_model
+    return "claude-sonnet-4-5"  # safe default
+
+
+class AnthropicDirectClient:
+    """
+    Direct Anthropic API client. Bypasses OpenRouter completely.
+    Supports tool_use, prompt caching (cache_control).
+    Uses native anthropic SDK.
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        if not self._api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY not set")
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            try:
+                import anthropic
+                self._client = anthropic.Anthropic(api_key=self._api_key)
+            except ImportError:
+                raise RuntimeError("anthropic SDK not installed. Run: pip install anthropic")
+        return self._client
+
+    def _convert_messages(self, messages: List[Dict[str, Any]]) -> tuple:
+        """
+        Convert OpenAI-format messages to Anthropic format.
+        Returns (system_prompt: str, messages: list).
+        """
+        import json as _json
+        system_parts = []
+        anthropic_messages = []
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "system":
+                if isinstance(content, str):
+                    system_parts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            system_parts.append(block.get("text", ""))
+                continue
+
+            if role == "assistant":
+                tool_calls = msg.get("tool_calls") or []
+                if tool_calls:
+                    ant_content = []
+                    if content:
+                        ant_content.append({"type": "text", "text": str(content)})
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        args = func.get("arguments", "{}")
+                        if isinstance(args, str):
+                            try:
+                                args = _json.loads(args)
+                            except Exception:
+                                args = {}
+                        ant_content.append({
+                            "type": "tool_use",
+                            "id": tc.get("id", f"tool_{len(ant_content)}"),
+                            "name": func.get("name", ""),
+                            "input": args,
+                        })
+                    anthropic_messages.append({"role": "assistant", "content": ant_content})
+                else:
+                    if isinstance(content, list):
+                        anthropic_messages.append({"role": "assistant", "content": content})
+                    else:
+                        anthropic_messages.append({"role": "assistant", "content": str(content) if content else ""})
+                continue
+
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id", "")
+                result_content = content
+                if not isinstance(result_content, list):
+                    result_content = [{"type": "text", "text": str(result_content) if result_content else ""}]
+                tool_result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": result_content,
+                }
+                if (anthropic_messages and
+                        anthropic_messages[-1]["role"] == "user" and
+                        isinstance(anthropic_messages[-1]["content"], list)):
+                    anthropic_messages[-1]["content"].append(tool_result_block)
+                else:
+                    anthropic_messages.append({"role": "user", "content": [tool_result_block]})
+                continue
+
+            if role == "user":
+                if isinstance(content, list):
+                    anthropic_messages.append({"role": "user", "content": content})
+                else:
+                    anthropic_messages.append({"role": "user", "content": str(content) if content else ""})
+
+        system_prompt = "\n\n".join(system_parts) if system_parts else ""
+        return system_prompt, anthropic_messages
+
+    def _convert_tools(self, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert OpenAI tool format to Anthropic tool format."""
+        anthropic_tools = []
+        for tool in tools:
+            if tool.get("type") != "function":
+                continue
+            func = tool.get("function", {})
+            ant_tool: Dict[str, Any] = {
+                "name": func.get("name", ""),
+                "description": func.get("description", ""),
+                "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+            }
+            if "cache_control" in tool:
+                ant_tool["cache_control"] = tool["cache_control"]
+            anthropic_tools.append(ant_tool)
+        return anthropic_tools
+
+    def _convert_response(self, resp) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Convert native Anthropic response to OpenAI-compatible format."""
+        import json as _json
+
+        content_blocks = resp.content or []
+        text_parts = []
+        tool_calls = []
+
+        for block in content_blocks:
+            if hasattr(block, "type"):
+                if block.type == "text":
+                    text_parts.append(block.text)
+                elif block.type == "tool_use":
+                    tool_calls.append({
+                        "id": block.id,
+                        "type": "function",
+                        "function": {
+                            "name": block.name,
+                            "arguments": _json.dumps(block.input) if isinstance(block.input, dict) else str(block.input),
+                        },
+                    })
+
+        msg = {
+            "role": "assistant",
+            "content": "\n".join(text_parts) if text_parts else None,
+        }
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+
+        usage_obj = resp.usage
+        prompt_tokens = getattr(usage_obj, "input_tokens", 0) or 0
+        completion_tokens = getattr(usage_obj, "output_tokens", 0) or 0
+        cached_tokens = getattr(usage_obj, "cache_read_input_tokens", 0) or 0
+        cache_write_tokens = getattr(usage_obj, "cache_creation_input_tokens", 0) or 0
+
+        MODEL_PRICING_ANTHROPIC = {
+            "claude-sonnet-4-5": (3.0, 0.3, 15.0),
+            "claude-opus-4-5": (15.0, 1.5, 75.0),
+            "claude-3-5-sonnet-20241022": (3.0, 0.3, 15.0),
+            "claude-3-5-haiku-20241022": (0.8, 0.08, 4.0),
+            "claude-3-haiku-20240307": (0.25, 0.03, 1.25),
+        }
+        model_name = resp.model or ""
+        pricing = None
+        for key, val in MODEL_PRICING_ANTHROPIC.items():
+            if model_name.startswith(key):
+                pricing = val
+                break
+        if pricing is None:
+            pricing = (3.0, 0.3, 15.0)
+
+        input_price, cached_price, output_price = pricing
+        cost = (
+            (prompt_tokens - cached_tokens) / 1_000_000 * input_price
+            + cached_tokens / 1_000_000 * cached_price
+            + cache_write_tokens / 1_000_000 * input_price * 1.25
+            + completion_tokens / 1_000_000 * output_price
+        )
+
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "cost": round(cost, 6),
+            "provider": "anthropic_direct",
+        }
+
+        log.info(
+            f"AnthropicDirect: {model_name} -> in={prompt_tokens} out={completion_tokens} "
+            f"cached={cached_tokens} cost=${cost:.4f}"
+        )
+        return msg, usage
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 16384,
+        tool_choice: str = "auto",
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Chat via Anthropic direct API."""
+        client = self._get_client()
+        anthropic_model = _map_to_anthropic_model(model)
+
+        system_prompt, ant_messages = self._convert_messages(messages)
+        ant_tools = self._convert_tools(tools) if tools else None
+
+        kwargs: Dict[str, Any] = {
+            "model": anthropic_model,
+            "max_tokens": min(max_tokens, 16384),
+            "messages": ant_messages,
+        }
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        if ant_tools:
+            kwargs["tools"] = ant_tools
+            if tool_choice == "auto":
+                kwargs["tool_choice"] = {"type": "auto"}
+            elif tool_choice == "none":
+                kwargs["tool_choice"] = {"type": "any"}
+
+        resp = client.messages.create(**kwargs)
+        return self._convert_response(resp)
+
+
 
 _google_client_cache = None
 
@@ -342,9 +608,29 @@ class LLMClient:
         try:
             resp = client.chat.completions.create(**kwargs)
         except Exception as openrouter_err:
+            log.warning(f"OpenRouter failed: {openrouter_err}")
+
+            # Fallback 1: Anthropic Direct API (if model is Anthropic)
+            if model.startswith("anthropic/"):
+                anthropic_cl = get_anthropic_client()
+                if anthropic_cl is not None:
+                    log.info("Falling back to Anthropic Direct API")
+                    try:
+                        return anthropic_cl.chat(
+                            messages=messages,
+                            model=model,
+                            tools=tools,
+                            reasoning_effort=reasoning_effort,
+                            max_tokens=max_tokens,
+                            tool_choice=tool_choice,
+                        )
+                    except Exception as anthropic_err:
+                        log.error(f"Anthropic Direct fallback failed: {anthropic_err}")
+
+            # Fallback 2: Google AI Studio
             google_cl = get_google_client()
             if google_cl is not None:
-                log.warning(f"OpenRouter failed ({openrouter_err}), falling back to Google AI Studio")
+                log.warning("Falling back to Google AI Studio")
                 try:
                     return google_cl.chat(
                         messages=messages,
@@ -356,6 +642,7 @@ class LLMClient:
                     )
                 except Exception as google_err:
                     log.error(f"Google AI Studio fallback also failed: {google_err}")
+
             raise openrouter_err
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
