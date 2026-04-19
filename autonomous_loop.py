@@ -19,42 +19,47 @@ class AutonomousLoop:
         self.tasks_file = tasks_file
         self.interval = interval
         self.tasks: List[Dict] = []
-        self._load_tasks()
 
-    def _load_tasks(self) -> None:
-        """Загружает задачи из файла."""
+    async def load_tasks(self) -> None:
+        """Загрузка задач из файла."""
         try:
-            with open(self.tasks_file, "r") as f:
-                self.tasks = json.load(f)
-            logger.info(f"Загружено {len(self.tasks)} задач из {self.tasks_file}")
+            with open(self.tasks_file, "r") as file:
+                self.tasks = json.load(file)
+            logger.info(f"Loaded {len(self.tasks)} tasks from {self.tasks_file}")
         except FileNotFoundError:
-            logger.warning(f"Файл {self.tasks_file} не найден. Создан новый список задач.")
+            logger.warning(f"Tasks file {self.tasks_file} not found. Starting with empty tasks list.")
             self.tasks = []
         except json.JSONDecodeError:
-            logger.error(f"Ошибка декодирования {self.tasks_file}. Создан новый список задач.")
+            logger.error(f"Invalid JSON in {self.tasks_file}. Starting with empty tasks list.")
             self.tasks = []
 
-    def _save_tasks(self) -> None:
-        """Сохраняет задачи в файл."""
-        with open(self.tasks_file, "w") as f:
-            json.dump(self.tasks, f, indent=2)
-        logger.info(f"Сохранено {len(self.tasks)} задач в {self.tasks_file}")
+    async def save_tasks(self) -> None:
+        """Сохранение задач в файл."""
+        with open(self.tasks_file, "w") as file:
+            json.dump(self.tasks, file, indent=2)
+        logger.info(f"Saved {len(self.tasks)} tasks to {self.tasks_file}")
 
-    async def _process_tasks(self) -> None:
-        """Обрабатывает задачи в цикле."""
+    async def run_task(self, task: Dict) -> None:
+        """Выполнение одной задачи."""
+        try:
+            logger.info(f"Running task: {task.get('description', 'No description')}")
+            # Здесь будет логика выполнения задачи (например, вызов инструментов)
+            await asyncio.sleep(1)  # Заглушка для имитации работы
+            logger.info(f"Task completed: {task.get('description', 'No description')}")
+        except Exception as e:
+            logger.error(f"Task failed: {e}")
+
+    async def main_loop(self) -> None:
+        """Основной цикл проверки и выполнения задач."""
         while True:
-            if self.tasks:
-                task = self.tasks.pop(0)
-                logger.info(f"Обработка задачи: {task.get('description', 'Без описания')}")
-                # Здесь будет логика выполнения задачи
-                self._save_tasks()
+            await self.load_tasks()
+            for task in self.tasks:
+                if not task.get("completed", False):
+                    await self.run_task(task)
+                    task["completed"] = True
+                    await self.save_tasks()
             await asyncio.sleep(self.interval)
-
-    async def start(self) -> None:
-        """Запускает автономный цикл."""
-        logger.info("Автономный цикл запущен")
-        await self._process_tasks()
 
 if __name__ == "__main__":
     loop = AutonomousLoop()
-    asyncio.run(loop.start())
+    asyncio.run(loop.main_loop())
