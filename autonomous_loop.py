@@ -19,50 +19,41 @@ class AutonomousLoop:
         self.tasks_file = tasks_file
         self.interval = interval
         self.tasks: List[Dict] = []
-        self.running = False
 
-    async def load_tasks(self):
+    async def load_tasks(self) -> None:
         """Загрузка задач из файла."""
         try:
             with open(self.tasks_file, "r") as f:
                 self.tasks = json.load(f)
-            logger.info(f"Загружено {len(self.tasks)} задач.")
+            logger.info(f"Загружено {len(self.tasks)} задач из {self.tasks_file}")
         except FileNotFoundError:
-            logger.warning("Файл задач не найден. Создан новый.")
+            logger.warning(f"Файл {self.tasks_file} не найден. Создан новый список задач.")
             self.tasks = []
         except json.JSONDecodeError:
-            logger.error("Ошибка чтения файла задач. Файл поврежден.")
+            logger.error(f"Ошибка декодирования JSON в файле {self.tasks_file}. Создан новый список задач.")
             self.tasks = []
 
-    async def save_tasks(self):
+    async def save_tasks(self) -> None:
         """Сохранение задач в файл."""
         with open(self.tasks_file, "w") as f:
             json.dump(self.tasks, f, indent=2)
-        logger.info("Задачи сохранены.")
+        logger.info(f"Сохранено {len(self.tasks)} задач в {self.tasks_file}")
 
-    async def process_tasks(self):
+    async def process_tasks(self) -> None:
         """Обработка задач."""
         for task in self.tasks:
             if not task.get("completed", False):
                 logger.info(f"Обработка задачи: {task.get('description', 'Без описания')}")
                 # Здесь будет логика выполнения задачи
                 task["completed"] = True
-                await self.save_tasks()
 
-    async def run(self):
+    async def run(self) -> None:
         """Запуск автономного цикла."""
-        self.running = True
-        logger.info("Автономный цикл запущен.")
         await self.load_tasks()
-
-        while self.running:
+        while True:
             await self.process_tasks()
+            await self.save_tasks()
             await asyncio.sleep(self.interval)
-
-    def stop(self):
-        """Остановка автономного цикла."""
-        self.running = False
-        logger.info("Автономный цикл остановлен.")
 
 if __name__ == "__main__":
     loop = AutonomousLoop()
