@@ -182,6 +182,125 @@ def _map_to_anthropic_model(openrouter_model: str) -> str:
     return "claude-sonnet-4-5"  # safe default
 
 
+
+# ─────────────────────────────────────────────────────────
+# DeepSeek Direct API client (OpenAI-compatible)
+# ─────────────────────────────────────────────────────────
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+DEEPSEEK_MODEL_MAP: Dict[str, str] = {
+    "deepseek/deepseek-chat": "deepseek-chat",
+    "deepseek/deepseek-coder": "deepseek-coder",
+    "anthropic/claude-sonnet-4.6": "deepseek-chat",
+    "anthropic/claude-opus-4.6": "deepseek-chat",
+    "openai/gpt-4o": "deepseek-chat",
+    "openai/gpt-4o-mini": "deepseek-chat",
+    "google/gemini-2.5-flash": "deepseek-chat",
+}
+
+DEEPSEEK_MODEL_PRICING: Dict[str, Tuple[float, float]] = {
+    "deepseek-chat": (0.27, 1.10),   # input/output per 1M tokens
+    "deepseek-coder": (0.27, 1.10),
+    "deepseek-reasoner": (0.55, 2.19),
+}
+
+_deepseek_client_cache = None
+
+
+def get_deepseek_client():
+    """Return cached DeepSeekClient or None if unavailable."""
+    global _deepseek_client_cache
+    if _deepseek_client_cache is not None:
+        return _deepseek_client_cache
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        _deepseek_client_cache = DeepSeekClient(api_key=api_key)
+        return _deepseek_client_cache
+    except Exception as e:
+        log.warning(f"Could not create DeepSeekClient: {e}")
+        return None
+
+
+def _map_to_deepseek_model(openrouter_model: str) -> str:
+    """Map OpenRouter model name to DeepSeek model ID."""
+    if openrouter_model in DEEPSEEK_MODEL_MAP:
+        return DEEPSEEK_MODEL_MAP[openrouter_model]
+    if openrouter_model.startswith("deepseek-"):
+        return openrouter_model
+    return "deepseek-chat"  # safe default
+
+
+class DeepSeekClient:
+    """
+    Direct DeepSeek API client. OpenAI-compatible endpoint.
+    Bypasses OpenRouter completely.
+    """
+
+    def __init__(self, api_key: Optional[str] = None):
+        self._api_key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
+        if not self._api_key:
+            raise RuntimeError("DEEPSEEK_API_KEY not set")
+        self._openai_client = None
+
+    def _get_client(self):
+        if self._openai_client is None:
+            try:
+                import openai
+                self._openai_client = openai.OpenAI(
+                    api_key=self._api_key,
+                    base_url=DEEPSEEK_BASE_URL,
+                )
+            except ImportError:
+                raise RuntimeError("openai package required for DeepSeekClient")
+        return self._openai_client
+
+    def chat(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str = "deepseek-chat",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 4096,
+        tool_choice: Optional[Any] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Send chat to DeepSeek API. Returns (message_dict, usage_dict)."""
+        native_model = _map_to_deepseek_model(model)
+        client = self._get_client()
+
+        kwargs: Dict[str, Any] = {
+            "model": native_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if tools:
+            kwargs["tools"] = tools
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
+
+        resp = client.chat.completions.create(**kwargs)
+        resp_dict = resp.model_dump()
+        usage_raw = resp_dict.get("usage") or {}
+
+        # Calculate cost from pricing table
+        prompt_tokens = int(usage_raw.get("prompt_tokens") or 0)
+        completion_tokens = int(usage_raw.get("completion_tokens") or 0)
+        pricing = DEEPSEEK_MODEL_PRICING.get(native_model, (0.27, 1.10))
+        cost = (prompt_tokens * pricing[0] + completion_tokens * pricing[1]) / 1_000_000
+
+        usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": int(usage_raw.get("total_tokens") or 0),
+            "cached_tokens": int((usage_raw.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+            "cost": cost,
+        }
+
+        choices = resp_dict.get("choices") or [{}]
+        msg = (choices[0] if choices else {}).get("message") or {}
+        return msg, usage
+
 class AnthropicDirectClient:
     """
     Direct Anthropic API client. Bypasses OpenRouter completely.
@@ -642,6 +761,22 @@ class LLMClient:
                     )
                 except Exception as google_err:
                     log.error(f"Google AI Studio fallback also failed: {google_err}")
+
+            # Fallback 3: DeepSeek Direct API
+            deepseek_cl = get_deepseek_client()
+            if deepseek_cl is not None:
+                log.warning("Falling back to DeepSeek Direct API")
+                try:
+                    return deepseek_cl.chat(
+                        messages=messages,
+                        model=model,
+                        tools=tools,
+                        reasoning_effort=reasoning_effort,
+                        max_tokens=max_tokens,
+                        tool_choice=tool_choice,
+                    )
+                except Exception as deepseek_err:
+                    log.error(f"DeepSeek fallback also failed: {deepseek_err}")
 
             raise openrouter_err
         resp_dict = resp.model_dump()
