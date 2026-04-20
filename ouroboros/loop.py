@@ -913,12 +913,19 @@ def _call_llm_with_retry(
 
         except Exception as e:
             last_error = e
+            err_str = repr(e)
             append_jsonl(drive_logs / "events.jsonl", {
                 "ts": utc_now_iso(), "type": "llm_api_error",
                 "task_id": task_id,
                 "round": round_idx, "attempt": attempt + 1,
-                "model": model, "error": repr(e),
+                "model": model, "error": err_str,
             })
+            # 402 = payment required — retrying OpenRouter is pointless, break immediately
+            import ouroboros.llm as _llm_mod
+            if "402" in err_str or "Payment Required" in err_str or "insufficient" in err_str.lower():
+                log.warning("OpenRouter 402 detected — switching to direct APIs, skipping retries")
+                _llm_mod._openrouter_payment_failed = True
+                break  # break retry loop; caller will handle None result
             if attempt < max_retries - 1:
                 time.sleep(min(2 ** attempt * 2, 30))
 

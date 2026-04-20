@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_LIGHT_MODEL = "google/gemini-2.5-flash-preview"
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -205,6 +205,10 @@ DEEPSEEK_MODEL_PRICING: Dict[str, Tuple[float, float]] = {
 }
 
 _deepseek_client_cache = None
+
+# Global flag: set True when OpenRouter returns 402 (insufficient funds)
+# Cleared automatically when balance is restored.
+_openrouter_payment_failed: bool = False
 
 
 def get_deepseek_client():
@@ -658,6 +662,73 @@ class LLMClient:
             )
         return self._client
 
+    def _call_direct_apis(
+        self,
+        messages,
+        model: str,
+        tools=None,
+        reasoning_effort: str = "medium",
+        max_tokens: int = 16384,
+        tool_choice: str = "auto",
+    ):
+        """
+        Route call to a direct API (Anthropic / Google AI Studio / DeepSeek).
+        Priority:
+          1. Anthropic Direct — if model is an Anthropic model
+          2. DeepSeek — lightweight everyday tasks (cheap)
+          3. Google AI Studio — as secondary backup
+          Raises the last exception if all fail.
+        """
+        last_err = None
+
+        # 1. Anthropic Direct — best for Anthropic models, also good for code tasks
+        if model.startswith("anthropic/"):
+            anthropic_cl = get_anthropic_client()
+            if anthropic_cl is not None:
+                log.info("Direct API → Anthropic")
+                try:
+                    return anthropic_cl.chat(
+                        messages=messages, model=model, tools=tools,
+                        reasoning_effort=reasoning_effort,
+                        max_tokens=max_tokens, tool_choice=tool_choice,
+                    )
+                except Exception as e:
+                    log.error(f"Anthropic Direct failed: {e}")
+                    last_err = e
+
+        # 2. DeepSeek Direct — cheap, handles general tasks well
+        deepseek_cl = get_deepseek_client()
+        if deepseek_cl is not None:
+            log.info("Direct API → DeepSeek")
+            try:
+                return deepseek_cl.chat(
+                    messages=messages, model=model, tools=tools,
+                    reasoning_effort=reasoning_effort,
+                    max_tokens=max_tokens, tool_choice=tool_choice,
+                )
+            except Exception as e:
+                log.error(f"DeepSeek Direct failed: {e}")
+                last_err = e
+
+        # 3. Google AI Studio — fallback of fallbacks
+        google_cl = get_google_client()
+        if google_cl is not None:
+            log.warning("Direct API → Google AI Studio")
+            try:
+                return google_cl.chat(
+                    messages=messages, model=model, tools=tools,
+                    reasoning_effort=reasoning_effort,
+                    max_tokens=max_tokens, tool_choice=tool_choice,
+                )
+            except Exception as e:
+                log.error(f"Google AI Studio failed: {e}")
+                last_err = e
+
+        raise RuntimeError(
+            "All direct API providers failed. Check your API keys and balances."
+            + (f" Last error: {last_err}" if last_err else "")
+        )
+
     def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
         """Fetch cost from OpenRouter Generation API as fallback."""
         try:
@@ -724,61 +795,37 @@ class LLMClient:
             kwargs["tools"] = tools_with_cache
             kwargs["tool_choice"] = tool_choice
 
+        global _openrouter_payment_failed
+
+        # If OpenRouter is known to be out of funds — skip it entirely
+        if _openrouter_payment_failed:
+            log.warning("OpenRouter payment failed flag set — skipping to direct APIs")
+            return self._call_direct_apis(
+                messages=messages, model=model, tools=tools,
+                reasoning_effort=reasoning_effort, max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
+
         try:
             resp = client.chat.completions.create(**kwargs)
         except Exception as openrouter_err:
-            log.warning(f"OpenRouter failed: {openrouter_err}")
+            err_str = str(openrouter_err)
+            # Detect 402 Payment Required — no point retrying, switch to direct APIs
+            is_payment_error = ("402" in err_str or
+                                "insufficient" in err_str.lower() or
+                                "payment" in err_str.lower() or
+                                "credit" in err_str.lower() and "balance" in err_str.lower())
+            if is_payment_error:
+                _openrouter_payment_failed = True
+                log.warning(f"OpenRouter 402 payment error — switching to direct APIs permanently: {err_str[:120]}")
+            else:
+                log.warning(f"OpenRouter failed: {err_str[:120]}")
 
-            # Fallback 1: Anthropic Direct API (if model is Anthropic)
-            if model.startswith("anthropic/"):
-                anthropic_cl = get_anthropic_client()
-                if anthropic_cl is not None:
-                    log.info("Falling back to Anthropic Direct API")
-                    try:
-                        return anthropic_cl.chat(
-                            messages=messages,
-                            model=model,
-                            tools=tools,
-                            reasoning_effort=reasoning_effort,
-                            max_tokens=max_tokens,
-                            tool_choice=tool_choice,
-                        )
-                    except Exception as anthropic_err:
-                        log.error(f"Anthropic Direct fallback failed: {anthropic_err}")
-
-            # Fallback 2: Google AI Studio
-            google_cl = get_google_client()
-            if google_cl is not None:
-                log.warning("Falling back to Google AI Studio")
-                try:
-                    return google_cl.chat(
-                        messages=messages,
-                        model=model,
-                        tools=tools,
-                        reasoning_effort=reasoning_effort,
-                        max_tokens=max_tokens,
-                        tool_choice=tool_choice,
-                    )
-                except Exception as google_err:
-                    log.error(f"Google AI Studio fallback also failed: {google_err}")
-
-            # Fallback 3: DeepSeek Direct API
-            deepseek_cl = get_deepseek_client()
-            if deepseek_cl is not None:
-                log.warning("Falling back to DeepSeek Direct API")
-                try:
-                    return deepseek_cl.chat(
-                        messages=messages,
-                        model=model,
-                        tools=tools,
-                        reasoning_effort=reasoning_effort,
-                        max_tokens=max_tokens,
-                        tool_choice=tool_choice,
-                    )
-                except Exception as deepseek_err:
-                    log.error(f"DeepSeek fallback also failed: {deepseek_err}")
-
-            raise openrouter_err
+            return self._call_direct_apis(
+                messages=messages, model=model, tools=tools,
+                reasoning_effort=reasoning_effort, max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
         choices = resp_dict.get("choices") or [{}]

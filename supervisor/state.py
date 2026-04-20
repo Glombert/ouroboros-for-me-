@@ -295,6 +295,15 @@ def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
             result["limit_usd"] = limit_usd
         if remaining_usd is not None:
             result["remaining_usd"] = remaining_usd
+        # If balance > 0 — reset the "payment failed" flag so OpenRouter is tried again
+        if remaining_usd and remaining_usd > 0:
+            try:
+                import ouroboros.llm as _llm_mod
+                if _llm_mod._openrouter_payment_failed:
+                    _llm_mod._openrouter_payment_failed = False
+                    log.info("OpenRouter balance restored (%.4f USD) — re-enabling OpenRouter", remaining_usd)
+            except Exception:
+                pass
         return result
     except Exception:
         log.warning("Failed to fetch OpenRouter ground truth", exc_info=True)
