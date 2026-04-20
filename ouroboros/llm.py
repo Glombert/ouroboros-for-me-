@@ -672,29 +672,30 @@ class LLMClient:
         tool_choice: str = "auto",
     ):
         """
-        Route call to a direct API (Anthropic / Google AI Studio / DeepSeek).
+        Route call to a direct API (Anthropic / DeepSeek / Google AI Studio).
+        Always tries Anthropic first — regardless of original model — because it is
+        most capable and has independent balance.
         Priority:
-          1. Anthropic Direct — if model is an Anthropic model
-          2. DeepSeek — lightweight everyday tasks (cheap)
-          3. Google AI Studio — as secondary backup
-          Raises the last exception if all fail.
+          1. Anthropic Direct — always tried first
+          2. DeepSeek — cheap, good for everyday tasks
+          3. Google AI Studio — fallback of fallbacks
+        Raises RuntimeError if all providers fail.
         """
         last_err = None
 
-        # 1. Anthropic Direct — best for Anthropic models, also good for code tasks
-        if model.startswith("anthropic/"):
-            anthropic_cl = get_anthropic_client()
-            if anthropic_cl is not None:
-                log.info("Direct API → Anthropic")
-                try:
-                    return anthropic_cl.chat(
-                        messages=messages, model=model, tools=tools,
-                        reasoning_effort=reasoning_effort,
-                        max_tokens=max_tokens, tool_choice=tool_choice,
-                    )
-                except Exception as e:
-                    log.error(f"Anthropic Direct failed: {e}")
-                    last_err = e
+        # 1. Anthropic Direct — ALWAYS tried first, regardless of original model
+        anthropic_cl = get_anthropic_client()
+        if anthropic_cl is not None:
+            log.info("Direct API → Anthropic (always first)")
+            try:
+                return anthropic_cl.chat(
+                    messages=messages, model=model, tools=tools,
+                    reasoning_effort=reasoning_effort,
+                    max_tokens=max_tokens, tool_choice=tool_choice,
+                )
+            except Exception as e:
+                log.error(f"Anthropic Direct failed: {e}")
+                last_err = e
 
         # 2. DeepSeek Direct — cheap, handles general tasks well
         deepseek_cl = get_deepseek_client()
