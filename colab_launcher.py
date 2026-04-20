@@ -111,6 +111,8 @@ except Exception as e:
 
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY", default="")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY", default="")
+DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY", default="")
+GOOGLE_AI_API_KEY = get_secret("GOOGLE_AI_API_KEY", default="")
 GITHUB_USER = get_cfg("GITHUB_USER", default=None, allow_legacy_secret=True)
 GITHUB_REPO = get_cfg("GITHUB_REPO", default=None, allow_legacy_secret=True)
 assert GITHUB_USER and str(GITHUB_USER).strip(), "GITHUB_USER not set. Add it to your config cell (see README)."
@@ -137,6 +139,8 @@ DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(
 os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
 os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
+os.environ["DEEPSEEK_API_KEY"] = str(DEEPSEEK_API_KEY or "")
+os.environ["GOOGLE_AI_API_KEY"] = str(GOOGLE_AI_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
 os.environ["GITHUB_REPO"] = str(GITHUB_REPO)
 os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "anthropic/claude-sonnet-4.6")
