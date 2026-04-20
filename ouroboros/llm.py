@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-2.5-flash-preview"
+DEFAULT_LIGHT_MODEL = "google/gemini-2.5-flash"
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -116,11 +116,11 @@ GOOGLE_OPENAI_BASE = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
 GOOGLE_MODEL_MAP: Dict[str, str] = {
     "anthropic/claude-sonnet-4.6": "gemini-2.0-flash",
-    "anthropic/claude-opus-4.6": "gemini-2.5-pro-preview-05-06",
+    "anthropic/claude-opus-4.6": "gemini-2.0-flash",
     "openai/gpt-4o": "gemini-2.0-flash",
     "openai/gpt-4o-mini": "gemini-2.0-flash-lite",
-    "google/gemini-2.5-flash": "gemini-2.5-flash-preview-04-17",
-    "google/gemini-2.5-pro": "gemini-2.5-pro-preview-05-06",
+    "google/gemini-2.5-flash": "gemini-2.0-flash",
+    "google/gemini-2.5-pro": "gemini-2.0-flash",
     "google/gemini-2.0-flash": "gemini-2.0-flash",
 }
 
@@ -276,7 +276,7 @@ class DeepSeekClient:
         kwargs: Dict[str, Any] = {
             "model": native_model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": min(max_tokens, 8192),
         }
         if tools:
             kwargs["tools"] = tools
@@ -828,8 +828,17 @@ class LLMClient:
             )
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
-        choices = resp_dict.get("choices") or [{}]
+        choices = resp_dict.get("choices") or []
         msg = (choices[0] if choices else {}).get("message") or {}
+
+        # If OpenRouter returned empty/null response — fall through to direct APIs
+        if not msg or not choices:
+            log.warning("OpenRouter returned empty/null response — falling through to direct APIs")
+            return self._call_direct_apis(
+                messages=messages, model=model, tools=tools,
+                reasoning_effort=reasoning_effort, max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
 
         # Extract cached_tokens from prompt_tokens_details if available
         if not usage.get("cached_tokens"):
