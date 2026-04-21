@@ -17,6 +17,46 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+def _send_emergency_tg_message(text: str) -> bool:
+    """Send an emergency message to the owner via Telegram without using LLM.
+    
+    This is a last-resort notification mechanism that works even when all
+    LLM providers are unavailable. Uses only raw HTTP requests.
+    Returns True if message was sent successfully.
+    """
+    try:
+        import urllib.request as _ureq
+        import urllib.parse as _uparse
+        import json as _j
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = None
+        try:
+            drive_root = os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/Ouroboros")
+            state_path = os.path.join(drive_root, "state", "state.json")
+            if os.path.exists(state_path):
+                with open(state_path) as _f:
+                    st = _j.load(_f)
+                chat_id = st.get("owner_chat_id") or st.get("owner_id")
+        except Exception:
+            pass
+        if not token or not chat_id:
+            log.warning("Emergency TG: no token or chat_id available")
+            return False
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = _uparse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        req = _ureq.Request(url, data=data, method="POST")
+        with _ureq.urlopen(req, timeout=10) as resp:
+            result = _j.loads(resp.read())
+            if result.get("ok"):
+                log.info("Emergency TG message sent successfully")
+                return True
+        log.warning("Emergency TG: response not ok")
+        return False
+    except Exception as e:
+        log.warning(f"Emergency TG exception: {e}")
+        return False
+
+
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
 
 
@@ -560,6 +600,11 @@ class LLMClient:
         ordered = _select_provider(effort, available)
 
         if not ordered:
+            _send_emergency_tg_message(
+                "⚠️ Мира: нет доступных API провайдеров!\n"
+                "Не найдено ни одного API ключа или баланс OpenRouter равен нулю.\n"
+                "Пожалуйста, проверь настройки и пополни баланс."
+            )
             raise RuntimeError("No LLM providers available (no keys configured, OpenRouter balance zero)")
 
         log.info(f"Selected provider: {ordered[0]} (effort={effort})")
@@ -594,7 +639,14 @@ class LLMClient:
                 errors.append(f"{provider}: {str(e)[:100]}")
                 log.warning(f"{provider} failed: {e}")
 
-        raise RuntimeError(f"All providers failed. Errors: {'; '.join(errors)}")
+        error_summary = "; ".join(errors)
+        _send_emergency_tg_message(
+            "⚠️ Мира: все API провайдеры недоступны!\n"
+            "Нет баланса ни на одном из аккаунтов (OpenRouter, Anthropic, DeepSeek, Google).\n"
+            "Пожалуйста, пополни баланс — я не могу работать.\n\n"
+            f"Ошибки: {error_summary[:300]}"
+        )
+        raise RuntimeError(f"All providers failed. Errors: {error_summary}")
 
     def vision_query(
         self,
