@@ -7,18 +7,35 @@ import threading
 import time
 import traceback
 import uuid
+from multiprocessing import Queue
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from supervisor.events import get_event_q
 from supervisor.git_ops import git_pull, git_status
-from supervisor.queue import enqueue_task
+from supervisor.queue import enqueue_task, _queue_lock
 from supervisor.state import DRIVE_ROOT, append_jsonl, load_state, save_state
 from supervisor.telegram import get_tg
 
 # Import agent lazily to avoid circular imports
 _agent_cache = None
 _agent_lock = threading.Lock()
+
+# Event queue for supervisor communication
+_EVENT_Q = None
+
+
+def _get_ctx():
+    """Get multiprocessing context (for compatibility)."""
+    import multiprocessing as mp
+    return mp.get_context("spawn")
+
+
+def get_event_q():
+    """Get the current EVENT_Q, creating if needed."""
+    global _EVENT_Q
+    if _EVENT_Q is None:
+        _EVENT_Q = _get_ctx().Queue()
+    return _EVENT_Q
 
 
 def _get_chat_agent():
@@ -259,3 +276,28 @@ def handle_forward_to_worker(task_id: str, text: str) -> None:
             },
         )
         raise
+
+
+# Worker management structures
+WORKERS: Dict[int, Any] = {}
+PENDING: List[Dict[str, Any]] = []
+RUNNING: Dict[str, Dict[str, Any]] = {}
+CRASH_TS: List[float] = []
+QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
+
+
+def get_running_task_ids() -> List[str]:
+    """Return list of task IDs currently being processed by workers."""
+    return [w.busy_task_id for w in WORKERS.values() if w.busy_task_id]
+
+
+class Worker:
+    """Worker process wrapper."""
+    def __init__(self, worker_id: int):
+        self.worker_id = worker_id
+        self.process = None
+        self.busy_task_id = None
+        self.busy_since = None
+        self.last_heartbeat = None
+        self.heartbeat_lag = 0.0
+        self.terminate_requested = False
