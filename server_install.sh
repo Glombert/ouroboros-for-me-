@@ -18,7 +18,7 @@ set -euo pipefail
 # ──────────────────────────────────────────────
 GITHUB_USER="${GITHUB_USER:-Glombert}"
 GITHUB_REPO="${GITHUB_REPO:-ouroboros-for-me-}"
-BRANCH="${BRANCH:-ouroboros}"
+BRANCH="${BRANCH:-main}"
 INSTALL_DIR="${INSTALL_DIR:-/root/ouroboros-for-me-}"
 GDRIVE_MOUNT="${GDRIVE_MOUNT:-/content/drive/MyDrive/Ouroboros}"
 RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive}"
@@ -113,10 +113,9 @@ OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY_HERE
 ANTHROPIC_API_KEY=YOUR_ANTHROPIC_KEY_HERE
 DEEPSEEK_API_KEY=YOUR_DEEPSEEK_KEY_HERE
 GOOGLE_AI_API_KEY=YOUR_GOOGLE_AI_KEY_HERE
-GEMINI_API_KEY=YOUR_GOOGLE_AI_KEY_HERE  # алиас для GOOGLE_AI_API_KEY
 
 # ──────────── Модели ────────────
-OUROBOROS_MODEL=anthropic/claude-sonnet-4.6
+OUROBOROS_MODEL=google/gemini-2.5-pro-preview
 OUROBOROS_MODEL_LIGHT=google/gemini-2.5-flash-preview
 OUROBOROS_WEBSEARCH_MODEL=google/gemini-2.5-flash-preview
 OUROBOROS_FALLBACK_MODELS=google/gemini-2.5-pro-preview
@@ -187,7 +186,7 @@ Wants=rclone-mount.service
 User=root
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${ENV_FILE}
-ExecStart=${VENV}/bin/python3 colab_launcher.py
+ExecStart=${VENV}/bin/python3 server_launcher.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
