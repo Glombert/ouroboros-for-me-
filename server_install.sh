@@ -1,147 +1,238 @@
 #!/usr/bin/env bash
-# ============================================================
-# Ouroboros — Server installer (Ubuntu/Linux)
-# ============================================================
-# Run this script once on your server to set up Ouroboros.
-# Prerequisites: Ubuntu 20.04+, Python 3.8+, git
+# ==============================================================================
+# Ouroboros — Server Installer (Ubuntu/Debian, root)
+# Разворачивает Миру на чистом сервере
 #
-# Usage:
+# Использование:
 #   bash server_install.sh
 #
-# After running:
-#   1. Edit ~/.env and fill in your API keys
-#   2. systemctl --user enable --now ouroboros
-# ============================================================
+# После запуска:
+#   1. Отредактируй /root/ouroboros-for-me-/.env — вставь реальные ключи
+#   2. Запусти скрипт ещё раз (он продолжит с шага rclone)
+# ==============================================================================
 
-set -e
-REPO_DIR="${OUROBOROS_REPO_DIR:-$HOME/ouroboros_repo}"
-DRIVE_ROOT="${OUROBOROS_DRIVE_ROOT:-$HOME/ouroboros_data}"
-GITHUB_USER="${GITHUB_USER:-igtip}"
-GITHUB_REPO="${GITHUB_REPO:-ouroboros}"
+set -euo pipefail
+
+# ──────────────────────────────────────────────
+# Конфигурация (можно переопределить через env)
+# ──────────────────────────────────────────────
+GITHUB_USER="${GITHUB_USER:-Glombert}"
+GITHUB_REPO="${GITHUB_REPO:-ouroboros-for-me-}"
 BRANCH="${BRANCH:-ouroboros}"
+INSTALL_DIR="${INSTALL_DIR:-/root/ouroboros-for-me-}"
+GDRIVE_MOUNT="${GDRIVE_MOUNT:-/content/drive/MyDrive/Ouroboros}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-gdrive}"
+RCLONE_PATH="${RCLONE_PATH:-Ouroboros}"
+
+REPO_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
+ENV_FILE="${INSTALL_DIR}/.env"
+VENV="${INSTALL_DIR}/venv"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+RED='\033[0;31m'
 NC='\033[0m'
 
 info()  { echo -e "${GREEN}[+]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
+die()   { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
-# ----------------------------
-# 1) Create local Drive dirs
-# ----------------------------
-info "Creating local Drive directories at $DRIVE_ROOT ..."
-mkdir -p "$DRIVE_ROOT"/{state,logs,memory,index,locks,archive}
+echo "======================================================"
+echo "  Ouroboros (Мира) — автоматическое развёртывание"
+echo "======================================================"
+echo ""
 
-# ----------------------------
-# 2) Clone repo (if not present)
-# ----------------------------
-if [ -d "$REPO_DIR/.git" ]; then
-    info "Repo already present at $REPO_DIR, pulling latest ..."
-    git -C "$REPO_DIR" fetch origin "$BRANCH" --quiet
-    git -C "$REPO_DIR" checkout "$BRANCH" --quiet
-    git -C "$REPO_DIR" reset --hard "origin/$BRANCH" --quiet
+# ──────────────────────────────────────────────
+# 1. Системные зависимости
+# ──────────────────────────────────────────────
+info "[1/9] Установка системных зависимостей..."
+apt-get update -qq
+apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    git curl fuse3 rclone
+
+# ──────────────────────────────────────────────
+# 2. Директории
+# ──────────────────────────────────────────────
+info "[2/9] Подготовка директорий..."
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$GDRIVE_MOUNT"
+
+# ──────────────────────────────────────────────
+# 3. Клонирование / обновление репозитория
+# ──────────────────────────────────────────────
+info "[3/9] Репозиторий..."
+if [ -d "$INSTALL_DIR/.git" ]; then
+    info "  Уже существует — обновляю (branch: $BRANCH)..."
+    git -C "$INSTALL_DIR" fetch origin "$BRANCH" --quiet
+    git -C "$INSTALL_DIR" checkout "$BRANCH" --quiet
+    git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH" --quiet
 else
-    info "Cloning repo to $REPO_DIR ..."
-    git clone --branch "$BRANCH" \
-        "https://github.com/$GITHUB_USER/$GITHUB_REPO.git" \
-        "$REPO_DIR"
+    info "  Клонирую $REPO_URL → $INSTALL_DIR..."
+    git clone --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
 fi
 
-# ----------------------------
-# 3) Install Python deps
-# ----------------------------
-info "Installing Python dependencies ..."
-pip3 install --user --quiet -r "$REPO_DIR/requirements.txt"
-pip3 install --user --quiet python-dotenv
+# ──────────────────────────────────────────────
+# 4. Python venv + зависимости
+# ──────────────────────────────────────────────
+info "[4/9] Python venv..."
+if [ ! -d "$VENV" ]; then
+    python3 -m venv "$VENV"
+fi
+"$VENV/bin/pip" install --quiet --upgrade pip
+"$VENV/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 
-# Check for optional playwright (not critical)
-pip3 install --user --quiet playwright playwright-stealth 2>/dev/null || \
-    warn "playwright not installed (optional, browser automation won't work)"
+# ──────────────────────────────────────────────
+# 5. .env — шаблон (создаётся только если нет)
+# ──────────────────────────────────────────────
+info "[5/9] Настройка .env..."
+if [ -f "$ENV_FILE" ]; then
+    info "  .env уже существует — пропускаю (ключи не перезаписываю)."
+else
+    info "  Создаю шаблон $ENV_FILE..."
+    cat > "$ENV_FILE" << 'ENVEOF'
+# ──────────────────────────────────────────────
+# Ouroboros — переменные окружения
+# Заполни все значения перед запуском!
+# ──────────────────────────────────────────────
 
-# ----------------------------
-# 4) Create .env template (only if missing)
-# ----------------------------
-ENV_FILE="$HOME/.env"
-if [ ! -f "$ENV_FILE" ]; then
-    info "Creating .env template at $ENV_FILE ..."
-    cat > "$ENV_FILE" << 'EOF'
-# Ouroboros — environment secrets
-# Fill in your values and save.
+# Telegram
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN_HERE
+TELEGRAM_OWNER_ID=YOUR_TELEGRAM_USER_ID_HERE
 
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
-OPENROUTER_API_KEY=your_openrouter_api_key_here
-GITHUB_TOKEN=your_github_token_here
-GITHUB_USER=igtip
-GITHUB_REPO=ouroboros
-TOTAL_BUDGET=10.0
+# GitHub
+GITHUB_TOKEN=YOUR_GITHUB_TOKEN_HERE
+GITHUB_USER=Glombert
+GITHUB_REPO=ouroboros-for-me-
 
-# Optional
-ANTHROPIC_API_KEY=
-OPENAI_API_KEY=
+# ──────────── LLM провайдеры ────────────
+# Основной (через OpenRouter)
+OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY_HERE
+
+# Прямые API (fallback-цепочка: Anthropic → DeepSeek → Google)
+ANTHROPIC_API_KEY=YOUR_ANTHROPIC_KEY_HERE
+DEEPSEEK_API_KEY=YOUR_DEEPSEEK_KEY_HERE
+GOOGLE_AI_API_KEY=YOUR_GOOGLE_AI_KEY_HERE
+GEMINI_API_KEY=YOUR_GOOGLE_AI_KEY_HERE  # алиас для GOOGLE_AI_API_KEY
+
+# ──────────── Модели ────────────
 OUROBOROS_MODEL=anthropic/claude-sonnet-4.6
-OUROBOROS_MAX_WORKERS=5
-EOF
+OUROBOROS_MODEL_LIGHT=google/gemini-2.5-flash-preview
+OUROBOROS_WEBSEARCH_MODEL=google/gemini-2.5-flash-preview
+OUROBOROS_FALLBACK_MODELS=google/gemini-2.5-pro-preview
+
+# ──────────── Бюджет (USD) ────────────
+TOTAL_BUDGET=10.0
+ENVEOF
     chmod 600 "$ENV_FILE"
-    warn ".env template created. Edit it now: nano ~/.env"
-else
-    info ".env already exists at $ENV_FILE — skipping template creation."
+    echo ""
+    warn "  *** Шаблон создан. Отредактируй $ENV_FILE и вставь реальные ключи. ***"
+    warn "  *** Затем запусти скрипт ещё раз. ***"
+    exit 1
 fi
 
-# ----------------------------
-# 5) Create systemd user service
-# ----------------------------
-SERVICE_DIR="$HOME/.config/systemd/user"
-mkdir -p "$SERVICE_DIR"
+# ──────────────────────────────────────────────
+# 6. rclone — проверка / интерактивная настройка
+# ──────────────────────────────────────────────
+info "[6/9] Настройка rclone (Google Drive)..."
+if rclone lsd "${RCLONE_REMOTE}:" &>/dev/null; then
+    info "  rclone уже настроен и работает."
+else
+    echo ""
+    warn "  Нужна настройка rclone remote '${RCLONE_REMOTE}'."
+    warn "  В меню выбери: n (new remote) → имя '${RCLONE_REMOTE}' → тип 'drive'"
+    warn "  После настройки скрипт продолжится автоматически."
+    echo ""
+    read -rp "  Нажми Enter для запуска rclone config..."
+    rclone config
+fi
 
-SERVICE_FILE="$SERVICE_DIR/ouroboros.service"
-info "Creating systemd user service at $SERVICE_FILE ..."
-cat > "$SERVICE_FILE" << EOF
+# ──────────────────────────────────────────────
+# 7. systemd: rclone-mount
+# ──────────────────────────────────────────────
+info "[7/9] systemd: rclone-mount.service..."
+cat > /etc/systemd/system/rclone-mount.service << EOF
 [Unit]
-Description=Ouroboros AI Agent
+Description=Rclone Google Drive Mount (Ouroboros Memory)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$REPO_DIR
-ExecStart=$(which python3) $REPO_DIR/server_launcher.py
-EnvironmentFile=$HOME/.env
+ExecStartPre=/bin/mkdir -p ${GDRIVE_MOUNT}
+ExecStart=/usr/bin/rclone mount ${RCLONE_REMOTE}:${RCLONE_PATH} ${GDRIVE_MOUNT} \
+    --vfs-cache-mode writes \
+    --allow-non-empty \
+    --log-level ERROR
+ExecStop=/bin/fusermount -u ${GDRIVE_MOUNT}
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ──────────────────────────────────────────────
+# 8. systemd: ouroboros
+# ──────────────────────────────────────────────
+info "[8/9] systemd: ouroboros.service..."
+cat > /etc/systemd/system/ouroboros.service << EOF
+[Unit]
+Description=Ouroboros AI Agent (Мира)
+After=network.target rclone-mount.service
+Wants=rclone-mount.service
+
+[Service]
+User=root
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${VENV}/bin/python3 colab_launcher.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=ouroboros
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 EOF
 
-# Enable lingering so service runs without active login session
-loginctl enable-linger "$(whoami)" 2>/dev/null || \
-    warn "Could not enable linger (may need root). Service will only run while logged in."
+# ──────────────────────────────────────────────
+# 9. Запуск сервисов
+# ──────────────────────────────────────────────
+info "[9/9] Запуск сервисов..."
+systemctl daemon-reload
 
-systemctl --user daemon-reload
-info "systemd service created."
+systemctl enable rclone-mount
+systemctl restart rclone-mount
+sleep 3
 
-# ----------------------------
-# Done
-# ----------------------------
+if mountpoint -q "$GDRIVE_MOUNT"; then
+    info "  Google Drive смонтирован: $GDRIVE_MOUNT ✅"
+else
+    warn "  Google Drive не смонтировался — проверь rclone config."
+    warn "  Ouroboros запустится, но без облачной памяти."
+fi
+
+systemctl enable ouroboros
+systemctl restart ouroboros
+sleep 2
+
+# ──────────────────────────────────────────────
+# Итог
+# ──────────────────────────────────────────────
 echo ""
-echo "========================================================"
-echo "  Ouroboros server setup complete!"
-echo "========================================================"
+echo "======================================================"
+echo "  Готово! Статус:"
+echo "======================================================"
+systemctl status ouroboros --no-pager -l || true
 echo ""
-echo "  Next steps:"
+systemctl status rclone-mount --no-pager || true
 echo ""
-echo "  1) Fill in API keys:      nano ~/.env"
-echo ""
-echo "  2) Start the service:     systemctl --user enable --now ouroboros"
-echo ""
-echo "  3) Check logs:            journalctl --user -u ouroboros -f"
-echo ""
-echo "  4) Stop:                  systemctl --user stop ouroboros"
-echo "  5) Restart:               systemctl --user restart ouroboros"
-echo ""
-echo "  Data directory:           $DRIVE_ROOT"
-echo "  Repo directory:           $REPO_DIR"
-echo "========================================================"
+echo "  Полезные команды:"
+echo "    Логи агента:      journalctl -u ouroboros -f"
+echo "    Перезапуск:       systemctl restart ouroboros"
+echo "    Остановка:        systemctl stop ouroboros"
+echo "    .env:             nano ${ENV_FILE}"
+echo "======================================================"
