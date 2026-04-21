@@ -4,7 +4,8 @@ Ouroboros — LLM client.
 The only module that communicates with the LLM API (OpenRouter).
 Contract: chat(), default_model(), available_models(), add_usage().
 
-Fallback chain: OpenRouter → Anthropic Direct → DeepSeek → Google AI Studio
+Provider selection: effort-aware, balance-checked on every call.
+Fallback chain per call: best available provider → next → ... → all 4 tried.
 """
 
 from __future__ import annotations
@@ -17,10 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 log = logging.getLogger(__name__)
 
 DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
-
-# Global flag: set to True when OpenRouter returns 402/401 or any failure
-# Forces all subsequent calls to use direct APIs
-_openrouter_payment_failed = False
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -361,30 +358,69 @@ def _call_google_direct(
 
 
 # ---------------------------------------------------------------------------
-# Main LLM client
+# Provider availability & selection
 # ---------------------------------------------------------------------------
 
-def _init_payment_flag_from_state() -> None:
-    """Read persisted openrouter_remaining_usd from state.json.
-    If it's 0.0, pre-emptively set _openrouter_payment_failed=True
-    so we don't waste 3 retry attempts on a dead provider at startup.
+def _check_provider_availability() -> Dict[str, bool]:
+    """Check which providers are currently available.
+
+    OpenRouter: balance from state.json must be > 0.
+    Others: presence of the corresponding API key env var.
     """
-    global _openrouter_payment_failed
-    if _openrouter_payment_failed:
-        return  # already set
+    available: Dict[str, bool] = {}
+
+    # OpenRouter — check persisted balance
     try:
-        import json
+        import json as _json
         drive_root = os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/Ouroboros")
         state_path = os.path.join(drive_root, "state", "state.json")
         if os.path.exists(state_path):
-            with open(state_path) as f:
-                st = json.load(f)
+            with open(state_path) as _f:
+                st = _json.load(_f)
             remaining = st.get("openrouter_remaining_usd")
-            if remaining is not None and float(remaining) <= 0.0:
-                _openrouter_payment_failed = True
-                log.info("Loaded state: OpenRouter balance=%.4f — starting in direct-API mode", float(remaining))
+            if remaining is not None:
+                available["openrouter"] = float(remaining) > 0.0
+            else:
+                available["openrouter"] = bool(os.environ.get("OPENROUTER_API_KEY", ""))
+        else:
+            available["openrouter"] = bool(os.environ.get("OPENROUTER_API_KEY", ""))
     except Exception:
-        pass  # non-critical, just don't set the flag
+        available["openrouter"] = bool(os.environ.get("OPENROUTER_API_KEY", ""))
+
+    available["anthropic"] = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+    available["deepseek"] = bool(os.environ.get("DEEPSEEK_API_KEY", ""))
+    available["google"] = bool(
+        os.environ.get("GOOGLE_AI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    )
+
+    return available
+
+
+def _select_provider(effort: str, available_providers: Dict[str, bool]) -> List[str]:
+    """Return ordered list of providers to try based on effort and availability.
+
+    xhigh/high  → Claude (quality) → DeepSeek → Gemini → OpenRouter
+    medium      → DeepSeek (value) → Claude → Gemini → OpenRouter
+    low/minimal/none → Gemini (free) → DeepSeek → Claude → OpenRouter
+    """
+    if effort in ("xhigh", "high"):
+        priority = ["anthropic", "deepseek", "google", "openrouter"]
+    elif effort == "medium":
+        priority = ["deepseek", "anthropic", "google", "openrouter"]
+    else:  # low, minimal, none
+        priority = ["google", "deepseek", "anthropic", "openrouter"]
+
+    ordered = [p for p in priority if available_providers.get(p, False)]
+    # Append any available provider not already in the list (safety net)
+    for p, avail in available_providers.items():
+        if avail and p not in ordered:
+            ordered.append(p)
+    return ordered
+
+
+# ---------------------------------------------------------------------------
+# Main LLM client
+# ---------------------------------------------------------------------------
 
 
 class LLMClient:
@@ -398,8 +434,6 @@ class LLMClient:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
-        # Initialize payment flag from persisted state
-        _init_payment_flag_from_state()
 
     def _get_client(self):
         if self._client is None:
@@ -436,6 +470,75 @@ class LLMClient:
             log.debug("Failed to fetch generation cost from OpenRouter", exc_info=True)
         return None
 
+    def _call_openrouter(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int,
+        tool_choice: str,
+        effort: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Call OpenRouter. Raises on any failure."""
+        client = self._get_client()
+        extra_body: Dict[str, Any] = {
+            "reasoning": {"effort": effort, "exclude": True},
+        }
+
+        if model.startswith("anthropic/"):
+            extra_body["provider"] = {
+                "order": ["Anthropic"],
+                "allow_fallbacks": False,
+                "require_parameters": True,
+            }
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "extra_body": extra_body,
+        }
+        if tools:
+            tools_with_cache = list(tools)
+            last_tool = {**tools_with_cache[-1]}
+            last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+            tools_with_cache[-1] = last_tool
+            kwargs["tools"] = tools_with_cache
+            kwargs["tool_choice"] = tool_choice
+
+        resp = client.chat.completions.create(**kwargs)
+        resp_dict = resp.model_dump()
+        usage = resp_dict.get("usage") or {}
+        choices = resp_dict.get("choices") or [{}]
+        msg = (choices[0] if choices else {}).get("message") or {}
+
+        if not msg or (not msg.get("content") and not msg.get("tool_calls")):
+            raise RuntimeError("OpenRouter returned empty response")
+
+        if not usage.get("cached_tokens"):
+            prompt_details = usage.get("prompt_tokens_details") or {}
+            if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
+                usage["cached_tokens"] = int(prompt_details["cached_tokens"])
+
+        if not usage.get("cache_write_tokens"):
+            prompt_details_for_write = usage.get("prompt_tokens_details") or {}
+            if isinstance(prompt_details_for_write, dict):
+                cache_write = (prompt_details_for_write.get("cache_write_tokens")
+                              or prompt_details_for_write.get("cache_creation_tokens")
+                              or prompt_details_for_write.get("cache_creation_input_tokens"))
+                if cache_write:
+                    usage["cache_write_tokens"] = int(cache_write)
+
+        if not usage.get("cost"):
+            gen_id = resp_dict.get("id") or ""
+            if gen_id:
+                cost = self._fetch_generation_cost(gen_id)
+                if cost is not None:
+                    usage["cost"] = cost
+
+        usage["provider"] = "openrouter"
+        return msg, usage
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -445,122 +548,51 @@ class LLMClient:
         max_tokens: int = 16384,
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Single LLM call. Returns: (response_message_dict, usage_dict with cost).
+        """Single LLM call. Returns (response_message_dict, usage_dict with cost).
 
-        Fallback chain: OpenRouter → Anthropic Direct → DeepSeek → Google AI Studio
+        Selects the best available provider based on effort level and current
+        provider availability (balance check for OpenRouter, key check for others).
+        Falls back through remaining providers on any failure.
         """
-        global _openrouter_payment_failed
         effort = normalize_reasoning_effort(reasoning_effort)
 
-        # ── Try OpenRouter first (unless we know it's unavailable) ──────────
-        if not _openrouter_payment_failed:
-            try:
-                client = self._get_client()
-                extra_body: Dict[str, Any] = {
-                    "reasoning": {"effort": effort, "exclude": True},
-                }
+        available = _check_provider_availability()
+        ordered = _select_provider(effort, available)
 
-                # Pin Anthropic models to Anthropic provider for prompt caching
-                if model.startswith("anthropic/"):
-                    extra_body["provider"] = {
-                        "order": ["Anthropic"],
-                        "allow_fallbacks": False,
-                        "require_parameters": True,
-                    }
+        if not ordered:
+            raise RuntimeError("No LLM providers available (no keys configured, OpenRouter balance zero)")
 
-                kwargs: Dict[str, Any] = {
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                    "extra_body": extra_body,
-                }
-                if tools:
-                    tools_with_cache = [t for t in tools]
-                    if tools_with_cache:
-                        last_tool = {**tools_with_cache[-1]}
-                        last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                        tools_with_cache[-1] = last_tool
-                    kwargs["tools"] = tools_with_cache
-                    kwargs["tool_choice"] = tool_choice
+        log.info(f"Selected provider: {ordered[0]} (effort={effort})")
 
-                resp = client.chat.completions.create(**kwargs)
-                resp_dict = resp.model_dump()
-                usage = resp_dict.get("usage") or {}
-                choices = resp_dict.get("choices") or [{}]
-                msg = (choices[0] if choices else {}).get("message") or {}
+        _provider_fns = {
+            "anthropic": lambda: _call_anthropic_direct(messages, tools=tools, max_tokens=max_tokens),
+            "deepseek":  lambda: _call_deepseek_direct(messages, tools=tools, max_tokens=max_tokens),
+            "google":    lambda: _call_google_direct(messages, tools=tools, max_tokens=max_tokens),
+            "openrouter": lambda: self._call_openrouter(messages, model, tools, max_tokens, tool_choice, effort),
+        }
+        _provider_labels = {
+            "anthropic": "anthropic_direct",
+            "deepseek":  "deepseek_direct",
+            "google":    "google_direct",
+            "openrouter": "openrouter",
+        }
 
-                # Treat empty response as failure → fallback
-                if not msg or (not msg.get("content") and not msg.get("tool_calls")):
-                    raise RuntimeError("OpenRouter returned empty response")
-
-                # Extract cached_tokens from prompt_tokens_details if available
-                if not usage.get("cached_tokens"):
-                    prompt_details = usage.get("prompt_tokens_details") or {}
-                    if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens"):
-                        usage["cached_tokens"] = int(prompt_details["cached_tokens"])
-
-                if not usage.get("cache_write_tokens"):
-                    prompt_details_for_write = usage.get("prompt_tokens_details") or {}
-                    if isinstance(prompt_details_for_write, dict):
-                        cache_write = (prompt_details_for_write.get("cache_write_tokens")
-                                      or prompt_details_for_write.get("cache_creation_tokens")
-                                      or prompt_details_for_write.get("cache_creation_input_tokens"))
-                        if cache_write:
-                            usage["cache_write_tokens"] = int(cache_write)
-
-                if not usage.get("cost"):
-                    gen_id = resp_dict.get("id") or ""
-                    if gen_id:
-                        cost = self._fetch_generation_cost(gen_id)
-                        if cost is not None:
-                            usage["cost"] = cost
-
-                return msg, usage
-
-            except Exception as e:
-                err_str = str(e)
-                if "402" in err_str or "insufficient" in err_str.lower() or "payment" in err_str.lower():
-                    log.warning("OpenRouter payment required (402) — switching to direct APIs permanently")
-                else:
-                    log.warning(f"OpenRouter failed ({err_str[:120]}) — switching to direct APIs")
-                _openrouter_payment_failed = True
-
-        # ── Direct API fallback chain ────────────────────────────────────────
-        log.info("Using direct API fallback: Anthropic → DeepSeek → Google")
         errors: List[str] = []
-
-        try:
-            log.info("Trying Anthropic Direct...")
-            msg, usage = _call_anthropic_direct(messages, tools=tools, max_tokens=max_tokens)
-            if msg and (msg.get("content") or msg.get("tool_calls")):
-                usage["provider"] = "anthropic_direct"
-                log.info("✓ Anthropic Direct: success")
-                return msg, usage
-        except Exception as e:
-            errors.append(f"Anthropic: {str(e)[:100]}")
-            log.warning(f"Anthropic Direct failed: {e}")
-
-        try:
-            log.info("Trying DeepSeek Direct...")
-            msg, usage = _call_deepseek_direct(messages, tools=tools, max_tokens=max_tokens)
-            if msg and (msg.get("content") or msg.get("tool_calls")):
-                usage["provider"] = "deepseek_direct"
-                log.info("✓ DeepSeek Direct: success")
-                return msg, usage
-        except Exception as e:
-            errors.append(f"DeepSeek: {str(e)[:100]}")
-            log.warning(f"DeepSeek Direct failed: {e}")
-
-        try:
-            log.info("Trying Google AI Studio Direct...")
-            msg, usage = _call_google_direct(messages, tools=tools, max_tokens=max_tokens)
-            if msg and (msg.get("content") or msg.get("tool_calls")):
-                usage["provider"] = "google_direct"
-                log.info("✓ Google AI Studio: success")
-                return msg, usage
-        except Exception as e:
-            errors.append(f"Google: {str(e)[:100]}")
-            log.warning(f"Google Direct failed: {e}")
+        for provider in ordered:
+            fn = _provider_fns.get(provider)
+            if fn is None:
+                continue
+            try:
+                log.info(f"Trying {provider}...")
+                msg, usage = fn()
+                if msg and (msg.get("content") or msg.get("tool_calls")):
+                    usage.setdefault("provider", _provider_labels[provider])
+                    log.info(f"✓ {provider}: success")
+                    return msg, usage
+                raise RuntimeError(f"{provider} returned empty response")
+            except Exception as e:
+                errors.append(f"{provider}: {str(e)[:100]}")
+                log.warning(f"{provider} failed: {e}")
 
         raise RuntimeError(f"All providers failed. Errors: {'; '.join(errors)}")
 
