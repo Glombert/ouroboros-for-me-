@@ -564,6 +564,9 @@ while True:
 
     for upd in updates:
         offset = int(upd["update_id"]) + 1
+        st = load_state()
+        st["tg_offset"] = offset
+        save_state(st)
         msg = upd.get("message") or upd.get("edited_message") or {}
         if not msg:
             continue
@@ -733,10 +736,6 @@ while True:
                 except Exception as _te:
                     log.error("Failed to start chat thread: %s", _te)
                     _consciousness.resume()
-
-    st = load_state()
-    st["tg_offset"] = offset
-    save_state(st)
 
     now_epoch = time.time()
     loop_duration_sec = now_epoch - loop_started_ts
