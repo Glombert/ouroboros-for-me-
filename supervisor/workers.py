@@ -1,154 +1,77 @@
-"""
-Supervisor — Worker lifecycle management.
-
-Multiprocessing workers, worker health, direct chat handling.
-Queue operations moved to supervisor.queue.
-"""
-
-from __future__ import annotations
-import logging
-log = logging.getLogger(__name__)
-
+"""Worker functions for handling tasks and direct chat."""
 import datetime
 import json
-import multiprocessing as mp
 import os
-import pathlib
-import sys
+import re
 import threading
 import time
+import traceback
 import uuid
-from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from supervisor.state import load_state, append_jsonl
-from supervisor import git_ops
-from supervisor.telegram import send_with_budget
+from supervisor.events import get_event_q
+from supervisor.git_ops import git_pull, git_status
+from supervisor.queue import enqueue_task
+from supervisor.state import DRIVE_ROOT, append_jsonl, load_state, save_state
+from supervisor.telegram import get_tg
 
-
-# ---------------------------------------------------------------------------
-# Module-level config (set via init())
-# ---------------------------------------------------------------------------
-REPO_DIR: pathlib.Path = pathlib.Path("/content/ouroboros_repo")
-DRIVE_ROOT: pathlib.Path = pathlib.Path("/content/drive/MyDrive/Ouroboros")
-MAX_WORKERS: int = 5
-SOFT_TIMEOUT_SEC: int = 600
-HARD_TIMEOUT_SEC: int = 1800
-HEARTBEAT_STALE_SEC: int = 120
-QUEUE_MAX_RETRIES: int = 1
-TOTAL_BUDGET_LIMIT: float = 0.0
-BRANCH_DEV: str = "ouroboros"
-BRANCH_STABLE: str = "ouroboros-stable"
-
-_CTX = None
-_LAST_SPAWN_TIME: float = 0.0  # grace period: don't count dead workers right after spawn
-_SPAWN_GRACE_SEC: float = 90.0  # workers need up to ~60s to init on Colab (spawn + pip + Drive FUSE)
-
-# On Linux/Colab, "spawn" re-imports __main__ (colab_launcher.py) in child processes.
-# Since launcher has top-level side effects, this causes worker child crashes (exitcode=1).
-# Use "fork" by default on Linux; allow override via env.
-_DEFAULT_WORKER_START_METHOD = "fork" if sys.platform.startswith("linux") else "spawn"
-_WORKER_START_METHOD = str(os.environ.get("OUROBOROS_WORKER_START_METHOD", _DEFAULT_WORKER_START_METHOD) or _DEFAULT_WORKER_START_METHOD).strip().lower()
-if _WORKER_START_METHOD not in {"fork", "spawn", "forkserver"}:
-    _WORKER_START_METHOD = _DEFAULT_WORKER_START_METHOD
-
-
-def _get_ctx():
-    """Return multiprocessing context used for worker processes."""
-    global _CTX
-    if _CTX is None:
-        _CTX = mp.get_context(_WORKER_START_METHOD)
-    return _CTX
-
-
-def init(repo_dir: pathlib.Path, drive_root: pathlib.Path, max_workers: int,
-         soft_timeout: int, hard_timeout: int, total_budget_limit: float,
-         branch_dev: str = "ouroboros", branch_stable: str = "ouroboros-stable") -> None:
-    global REPO_DIR, DRIVE_ROOT, MAX_WORKERS, SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC
-    global TOTAL_BUDGET_LIMIT, BRANCH_DEV, BRANCH_STABLE
-    REPO_DIR = repo_dir
-    DRIVE_ROOT = drive_root
-    MAX_WORKERS = max_workers
-    SOFT_TIMEOUT_SEC = soft_timeout
-    HARD_TIMEOUT_SEC = hard_timeout
-    TOTAL_BUDGET_LIMIT = total_budget_limit
-    BRANCH_DEV = branch_dev
-    BRANCH_STABLE = branch_stable
-
-    # Initialize queue module
-    from supervisor import queue
-    queue.init(drive_root, soft_timeout, hard_timeout)
-    queue.init_queue_refs(PENDING, RUNNING, QUEUE_SEQ_COUNTER_REF)
-
-
-# ---------------------------------------------------------------------------
-# Worker data structures
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Worker:
-    wid: int
-    proc: mp.Process
-    in_q: Any
-    busy_task_id: Optional[str] = None
-
-
-_EVENT_Q = None
-
-
-def get_event_q():
-    """Get the current EVENT_Q, creating if needed."""
-    global _EVENT_Q
-    if _EVENT_Q is None:
-        _EVENT_Q = _get_ctx().Queue()
-    return _EVENT_Q
-
-
-WORKERS: Dict[int, Worker] = {}
-PENDING: List[Dict[str, Any]] = []
-RUNNING: Dict[str, Dict[str, Any]] = {}
-CRASH_TS: List[float] = []
-QUEUE_SEQ_COUNTER_REF: Dict[str, int] = {"value": 0}
-
-# Lock for all mutations to PENDING, RUNNING, WORKERS shared collections.
-# Canonical definition lives in queue.py; imported here for use by assign_tasks/kill_workers.
-from supervisor.queue import _queue_lock
-
-
-def get_running_task_ids() -> List[str]:
-    """Return list of task IDs currently being processed by workers."""
-    return [w.busy_task_id for w in WORKERS.values() if w.busy_task_id]
-
-
-# ---------------------------------------------------------------------------
-# Chat agent (direct mode)
-# ---------------------------------------------------------------------------
-_chat_agent = None
+# Import agent lazily to avoid circular imports
+_agent_cache = None
+_agent_lock = threading.Lock()
 
 
 def _get_chat_agent():
-    global _chat_agent
-    if _chat_agent is None:
-        sys.path.insert(0, str(REPO_DIR))
-        from ouroboros.agent import make_agent
-        _chat_agent = make_agent(
-            repo_dir=str(REPO_DIR),
-            drive_root=str(DRIVE_ROOT),
-            event_queue=get_event_q(),
-        )
-    return _chat_agent
+    """Lazy load the chat agent."""
+    global _agent_cache
+    if _agent_cache is None:
+        with _agent_lock:
+            if _agent_cache is None:
+                from ouroboros.agent import Agent
+                _agent_cache = Agent()
+    return _agent_cache
 
 
 def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None) -> None:
+    """Handle a direct chat message from the owner."""
     try:
+        # Extract task tag from text if present
+        task_type = None
+        cleaned_text = text
+        
+        # Look for [tag] at the beginning of the message
+        tag_match = re.match(r'^\s*\[(\w+)\]\s*(.*)', text)
+        if tag_match:
+            tag = tag_match.group(1).lower()
+            cleaned_text = tag_match.group(2).strip()
+            
+            # Map tag to task_type
+            valid_tags = {
+                'code': 'code',
+                'research': 'research',
+                'chat': 'chat',
+                'test': 'test',
+                'evolve': 'evolve',
+                'diagnose': 'diagnose',
+                'admin': 'admin',
+            }
+            
+            if tag in valid_tags:
+                task_type = valid_tags[tag]
+        
         agent = _get_chat_agent()
         task = {
             "id": uuid.uuid4().hex[:8],
             "type": "task",
             "chat_id": chat_id,
-            "text": text,
+            "text": cleaned_text,
             "_is_direct_chat": True,
         }
+        
+        # Add task_type if extracted
+        if task_type:
+            task["task_type"] = task_type
+        
         if image_data:
             # image_data is (base64, mime) or (base64, mime, caption)
             task["image_base64"] = image_data[0]
@@ -156,7 +79,7 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
             if len(image_data) > 2 and image_data[2]:
                 task["image_caption"] = image_data[2]
                 # Prefer caption as task text if text is empty
-                if not text:
+                if not cleaned_text:
                     task["text"] = image_data[2]
         # Fallback for truly empty messages
         if not task["text"]:
@@ -178,411 +101,161 @@ def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple
         )
         try:
             from supervisor.telegram import get_tg
-            get_tg().send_message(chat_id, err_msg)
+            tg = get_tg()
+            tg.send_message(chat_id, err_msg)
         except Exception:
-            log.debug("Suppressed exception", exc_info=True)
+            pass
 
 
-# ---------------------------------------------------------------------------
-# Auto-resume after restart
-# ---------------------------------------------------------------------------
-
-def auto_resume_after_restart() -> None:
-    """If recent restart left open work, auto-resume without waiting for owner message.
-
-    Checks: scratchpad content, recent restart events, pending_restart_verify.
-    Background consciousness will subsume this eventually, but auto-resume is
-    needed immediately after a restart so the agent doesn't go silent.
-    """
+def handle_worker_task(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Handle a worker task (non-direct chat)."""
     try:
-        st = load_state()
-        chat_id = st.get("owner_chat_id")
-        if not chat_id:
-            return
-
-        # Check for recent restart (within 2 minutes)
-        restart_verify_path = DRIVE_ROOT / "state" / "pending_restart_verify.json"
-        recent_restart = False
-        if restart_verify_path.exists():
-            recent_restart = True
-        else:
-            # Check supervisor.jsonl for recent restart event
-            sup_log = DRIVE_ROOT / "logs" / "supervisor.jsonl"
-            if sup_log.exists():
-                try:
-                    lines = sup_log.read_text(encoding="utf-8").strip().split("\n")
-                    for line in reversed(lines[-20:]):
-                        if not line.strip():
-                            continue
-                        evt = json.loads(line)
-                        if evt.get("type") in ("launcher_start", "restart"):
-                            recent_restart = True
-                            break
-                except Exception:
-                    log.debug("Suppressed exception", exc_info=True)
-
-        if not recent_restart:
-            return
-
-        # Check if scratchpad has meaningful content
-        scratchpad_path = DRIVE_ROOT / "memory" / "scratchpad.md"
-        if not scratchpad_path.exists():
-            return
-
-        scratchpad = scratchpad_path.read_text(encoding="utf-8")
-        # Skip if scratchpad is empty or default
-        stripped = scratchpad.strip()
-        if not stripped or stripped == "# Scratchpad" or "(empty" in stripped.lower():
-            # Check if it's just the default template with all empty sections
-            content_lines = [
-                ln.strip() for ln in stripped.splitlines()
-                if ln.strip() and not ln.strip().startswith("#") and ln.strip() != "- (empty)"
-            ]
-            # Filter out UpdatedAt lines
-            content_lines = [ln for ln in content_lines if not ln.startswith("UpdatedAt:")]
-            if not content_lines:
-                return
-
-        # Auto-resume: inject synthetic message
-        time.sleep(2)  # Let everything initialize
         agent = _get_chat_agent()
-        if not agent._busy:
-            import threading
-            threading.Thread(
-                target=handle_chat_direct,
-                args=(int(chat_id),
-                      "[auto-resume after restart] Continue your work. Read scratchpad and identity — they contain context of what you were doing.",
-                      None),
-                daemon=True,
-            ).start()
-            append_jsonl(
-                DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                {
-                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "type": "auto_resume_triggered",
-                },
-            )
+        return agent.handle_task(task)
     except Exception as e:
-        append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
+        import traceback
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "type": "worker_task_error",
+                "task_id": task.get("id", "unknown"),
+                "error": repr(e),
+                "traceback": str(traceback.format_exc())[:2000],
+            },
+        )
+        # Re-raise so worker can handle it
+        raise
+
+
+def handle_restart_request(reason: str) -> None:
+    """Handle a restart request."""
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "type": "auto_resume_error",
-            "error": repr(e),
-        })
+            "type": "restart_request",
+            "reason": reason,
+        },
+    )
+    # Signal supervisor to restart
+    get_event_q().put({"type": "restart"})
 
 
-# ---------------------------------------------------------------------------
-# Worker process
-# ---------------------------------------------------------------------------
-
-def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str) -> None:
-    import sys as _sys
-    import traceback as _tb
-    import pathlib as _pathlib
-    _sys.path.insert(0, repo_dir)
-    _drive = _pathlib.Path(drive_root)
+def handle_promote_to_stable(reason: str) -> None:
+    """Handle a promote-to-stable request."""
     try:
-        from ouroboros.agent import make_agent
-        agent = make_agent(repo_dir=repo_dir, drive_root=drive_root, event_queue=out_q)
-    except Exception as _e:
-        _log_worker_crash(wid, _drive, "make_agent", _e, _tb.format_exc())
-        return
-    while True:
-        try:
-            task = in_q.get()
-            if task is None or task.get("type") == "shutdown":
-                break
-            events = agent.handle_task(task)
-            for e in events:
-                e2 = dict(e)
-                e2["worker_id"] = wid
-                out_q.put(e2)
-        except Exception as _e:
-            _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())
+        from supervisor.git_ops import git_promote_to_stable
+        git_promote_to_stable(reason)
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "type": "promote_to_stable",
+                "reason": reason,
+            },
+        )
+    except Exception as e:
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "type": "promote_to_stable_error",
+                "error": repr(e),
+                "traceback": str(traceback.format_exc())[:2000],
+            },
+        )
+        raise
 
 
-def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Exception, tb: str) -> None:
-    """Best-effort: write crash info to supervisor.jsonl from inside worker process."""
-    import os as _os
+def handle_switch_model(model: Optional[str] = None, effort: Optional[str] = None) -> None:
+    """Handle a model switch request."""
     try:
-        path = drive_root / "logs" / "supervisor.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        entry = json.dumps({
-            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "type": "worker_crash",
-            "worker_id": wid,
-            "pid": _os.getpid(),
-            "phase": phase,
-            "error": repr(exc),
-            "traceback": str(tb)[:3000],
-        }, ensure_ascii=False)
-        with path.open("a", encoding="utf-8") as f:
-            f.write(entry + "\n")
-    except Exception:
-        log.debug("Suppressed exception", exc_info=True)
+        agent = _get_chat_agent()
+        agent.switch_model(model=model, effort=effort)
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "type": "switch_model",
+                "model": model,
+                "effort": effort,
+            },
+        )
+    except Exception as e:
+        append_jsonl(
+            DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            {
+                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "type": "switch_model_error",
+                "error": repr(e),
+                "traceback": str(traceback.format_exc())[:2000],
+            },
+        )
+        raise
 
 
-def _first_worker_boot_event_since(offset_bytes: int) -> Optional[Dict[str, Any]]:
-    """Read first worker_boot event written after the given file offset."""
-    path = DRIVE_ROOT / "logs" / "events.jsonl"
-    if not path.exists():
-        return None
-    try:
-        with path.open("rb") as f:
-            f.seek(0, 2)
-            size = f.tell()
-            safe_offset = offset_bytes if 0 <= offset_bytes <= size else 0
-            f.seek(safe_offset)
-            data = f.read().decode("utf-8", errors="replace")
-    except Exception:
-        log.debug("Suppressed exception", exc_info=True)
-        return None
-
-    for line in data.splitlines():
-        raw = line.strip()
-        if not raw:
-            continue
-        try:
-            evt = json.loads(raw)
-        except Exception:
-            log.debug("Suppressed exception in loop", exc_info=True)
-            continue
-        if isinstance(evt, dict) and str(evt.get("type") or "") == "worker_boot":
-            return evt
-    return None
-
-
-def _verify_worker_sha_after_spawn(events_offset: int, timeout_sec: float = 90.0) -> None:
-    """Verify that newly spawned workers booted with expected current_sha."""
+def handle_toggle_evolution(enabled: bool) -> None:
+    """Handle evolution toggle request."""
     st = load_state()
-    expected_sha = str(st.get("current_sha") or "").strip()
-    if not expected_sha:
-        append_jsonl(
-            DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "worker_sha_verify_skipped",
-                "reason": "missing_current_sha",
-            },
-        )
-        return
-
-    deadline = time.time() + max(float(timeout_sec), 1.0)
-    boot_evt = None
-    while time.time() < deadline:
-        boot_evt = _first_worker_boot_event_since(events_offset)
-        if boot_evt is not None:
-            break
-        time.sleep(0.25)
-
-    if boot_evt is None:
-        append_jsonl(
-            DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "worker_sha_verify_timeout",
-                "expected_sha": expected_sha,
-            },
-        )
-        return
-
-    observed_sha = str(boot_evt.get("git_sha") or "").strip()
-    ok = bool(observed_sha and observed_sha == expected_sha)
+    st["evolution_mode_enabled"] = enabled
+    if not enabled:
+        st["evolution_consecutive_failures"] = 0
+    save_state(st)
     append_jsonl(
         DRIVE_ROOT / "logs" / "supervisor.jsonl",
         {
             "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "type": "worker_sha_verify",
-            "ok": ok,
-            "expected_sha": expected_sha,
-            "observed_sha": observed_sha,
-            "worker_pid": boot_evt.get("pid"),
+            "type": "toggle_evolution",
+            "enabled": enabled,
         },
     )
-    if not ok and st.get("owner_chat_id"):
-        send_with_budget(
-            int(st["owner_chat_id"]),
-            f"⚠️ Worker SHA mismatch after spawn: expected {expected_sha[:8]}, got {(observed_sha or 'unknown')[:8]}",
-        )
 
 
-def spawn_workers(n: int = 0) -> None:
-    global _CTX, _EVENT_Q
-    # Force fresh context to ensure workers use latest code
-    _CTX = mp.get_context(_WORKER_START_METHOD)
-    _EVENT_Q = _CTX.Queue()
-    events_path = DRIVE_ROOT / "logs" / "events.jsonl"
+def handle_toggle_consciousness(enabled: bool) -> None:
+    """Handle background consciousness toggle request."""
+    st = load_state()
+    st["background_consciousness_enabled"] = enabled
+    save_state(st)
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "type": "toggle_consciousness",
+            "enabled": enabled,
+        },
+    )
+
+
+def handle_forward_to_worker(task_id: str, text: str) -> None:
+    """Forward a message to a specific worker task."""
     try:
-        events_offset = int(events_path.stat().st_size)
-    except Exception:
-        events_offset = 0
-
-    count = n or MAX_WORKERS
-    append_jsonl(
-        DRIVE_ROOT / "logs" / "supervisor.jsonl",
-        {
-            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "type": "worker_spawn_start",
-            "start_method": _WORKER_START_METHOD,
-            "count": count,
-        },
-    )
-    WORKERS.clear()
-    for i in range(count):
-        in_q = _CTX.Queue()
-        proc = _CTX.Process(target=worker_main,
-                           args=(i, in_q, _EVENT_Q, str(REPO_DIR), str(DRIVE_ROOT)))
-        proc.daemon = True
-        proc.start()
-        WORKERS[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None)
-    global _LAST_SPAWN_TIME
-    _LAST_SPAWN_TIME = time.time()
-    # Run SHA verification in background to avoid blocking the main loop for up to 90s
-    threading.Thread(target=_verify_worker_sha_after_spawn, args=(events_offset,), daemon=True).start()
-
-
-def kill_workers() -> None:
-    from supervisor import queue
-    with _queue_lock:
-        cleared_running = len(RUNNING)
-        for w in WORKERS.values():
-            if w.proc.is_alive():
-                w.proc.terminate()
-        for w in WORKERS.values():
-            w.proc.join(timeout=5)
-        WORKERS.clear()
-        RUNNING.clear()
-    queue.persist_queue_snapshot(reason="kill_workers")
-    if cleared_running:
+        # Create a task for the worker
+        task = {
+            "id": uuid.uuid4().hex[:8],
+            "type": "worker_message",
+            "original_task_id": task_id,
+            "text": text,
+            "_is_direct_chat": False,
+        }
+        enqueue_task(task)
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "running_cleared_on_kill", "count": cleared_running,
+                "type": "forward_to_worker",
+                "task_id": task_id,
+                "forwarded_task_id": task["id"],
             },
         )
-
-
-def respawn_worker(wid: int) -> None:
-    global _LAST_SPAWN_TIME
-    ctx = _get_ctx()
-    in_q = ctx.Queue()
-    proc = ctx.Process(target=worker_main,
-                       args=(wid, in_q, get_event_q(), str(REPO_DIR), str(DRIVE_ROOT)))
-    proc.daemon = True
-    proc.start()
-    WORKERS[wid] = Worker(wid=wid, proc=proc, in_q=in_q, busy_task_id=None)
-    # Give freshly respawned workers the same init grace as startup workers.
-    _LAST_SPAWN_TIME = time.time()
-
-
-def assign_tasks() -> None:
-    from supervisor import queue
-    from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
-    with _queue_lock:
-        for w in WORKERS.values():
-            if w.busy_task_id is None and PENDING:
-                # Find first suitable task (skip over-budget evolution tasks)
-                chosen_idx = None
-                for i, candidate in enumerate(PENDING):
-                    if str(candidate.get("type") or "") == "evolution" and budget_remaining(load_state()) < EVOLUTION_BUDGET_RESERVE:
-                        continue
-                    chosen_idx = i
-                    break
-                if chosen_idx is None:
-                    # Only over-budget evolution tasks remain — clean them out
-                    PENDING[:] = [t for t in PENDING if str(t.get("type") or "") != "evolution"]
-                    queue.persist_queue_snapshot(reason="evolution_dropped_budget")
-                    continue
-                task = PENDING.pop(chosen_idx)
-                w.busy_task_id = task["id"]
-                w.in_q.put(task)
-                now_ts = time.time()
-                RUNNING[task["id"]] = {
-                    "task": dict(task), "worker_id": w.wid,
-                    "started_at": now_ts, "last_heartbeat_at": now_ts,
-                    "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
-                }
-                task_type = str(task.get("type") or "")
-                if task_type in ("evolution", "review"):
-                    st = load_state()
-                    if st.get("owner_chat_id"):
-                        emoji = '🧬' if task_type == 'evolution' else '🔎'
-                        send_with_budget(
-                            int(st["owner_chat_id"]),
-                            f"{emoji} {task_type.capitalize()} task {task['id']} started.",
-                        )
-                queue.persist_queue_snapshot(reason="assign_task")
-
-
-# ---------------------------------------------------------------------------
-# Health + crash storm
-# ---------------------------------------------------------------------------
-
-def ensure_workers_healthy() -> None:
-    from supervisor import queue
-    # Grace period: skip health check right after spawn — workers need time to initialize
-    if (time.time() - _LAST_SPAWN_TIME) < _SPAWN_GRACE_SEC:
-        return
-    busy_crashes = 0
-    dead_detections = 0
-    for wid, w in list(WORKERS.items()):
-        if not w.proc.is_alive():
-            dead_detections += 1
-            if w.busy_task_id is not None:
-                busy_crashes += 1
-            append_jsonl(
-                DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                {
-                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    "type": "worker_dead_detected",
-                    "worker_id": wid,
-                    "exitcode": w.proc.exitcode,
-                    "busy_task_id": w.busy_task_id,
-                },
-            )
-            if w.busy_task_id and w.busy_task_id in RUNNING:
-                meta = RUNNING.pop(w.busy_task_id) or {}
-                task = meta.get("task") if isinstance(meta, dict) else None
-                if isinstance(task, dict):
-                    queue.enqueue_task(task, front=True)
-            respawn_worker(wid)
-            queue.persist_queue_snapshot(reason="worker_respawn_after_crash")
-
-    now = time.time()
-    alive_now = sum(1 for w in WORKERS.values() if w.proc.is_alive())
-    if dead_detections:
-        # Count only meaningful failures:
-        # - any crash while a task was running, or
-        # - all workers dead at once.
-        if busy_crashes > 0 or alive_now == 0:
-            CRASH_TS.extend([now] * max(1, dead_detections))
-        else:
-            # Idle worker deaths with at least one healthy worker are degraded mode,
-            # not a crash storm condition.
-            CRASH_TS.clear()
-
-    CRASH_TS[:] = [t for t in CRASH_TS if (now - t) < 60.0]
-    if len(CRASH_TS) >= 3:
-        # Log crash storm but DON'T execv restart — that creates infinite loops.
-        # Instead: kill dead workers, notify owner, continue with direct-chat (threading).
-        st = load_state()
+    except Exception as e:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
                 "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "type": "crash_storm_detected",
-                "crash_count": len(CRASH_TS),
-                "worker_count": len(WORKERS),
+                "type": "forward_to_worker_error",
+                "error": repr(e),
+                "traceback": str(traceback.format_exc())[:2000],
             },
         )
-        if st.get("owner_chat_id"):
-            send_with_budget(
-                int(st["owner_chat_id"]),
-                "⚠️ Frequent worker crashes. Multiprocessing workers disabled, "
-                "continuing in direct-chat mode (threading).",
-            )
-        # Kill all workers — direct chat via handle_chat_direct still works
-        kill_workers()
-        CRASH_TS.clear()
-
-
+        raise
