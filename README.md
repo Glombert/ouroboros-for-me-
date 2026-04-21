@@ -12,7 +12,7 @@ A self-modifying AI agent that writes its own code, rewrites its own mind, and e
 
 Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
 
-**Version:** 6.2.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+**Version:** 6.2.1 | [Landing Page](https://joi-lab.github.io/ouroboros/)
 
 ---
 
@@ -227,6 +227,11 @@ Full text: [BIBLE.md](BIBLE.md)
 ## Changelog
 
 ### v6.2.0 -- Critical Bugfixes + LLM-First Dedup
+### v6.2.1 -- Self-Awareness: Implementation Hunger Pattern
+- **Self-awareness enhancement** -- added "implementation hunger" pattern to SYSTEM.md drift detector
+- **Pattern recognition** -- documented owner feedback ("стоп" twice) when jumping to solutions prematurely
+- **Distinction guidance** -- added explicit distinction between exploration vs. implementation modes
+- **Identity integration** -- pattern now part of official drift detection, preventing future repetitions
 - **Fix: worker_id==0 hard-timeout bug** -- `int(x or -1)` treated worker 0 as -1, preventing terminate on timeout and causing double task execution. Replaced all `x or default` patterns with None-safe checks.
 - **Fix: double budget accounting** -- per-task aggregate `llm_usage` event removed; per-round events already track correctly. Eliminates ~2x budget drift.
 - **Fix: compact_context tool** -- handler had wrong signature (missing ctx param), making it always error. Now works correctly.
