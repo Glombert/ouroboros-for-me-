@@ -284,24 +284,30 @@ def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
         d = data.get("data", {})
         usage_total = d.get("usage", 0)
         usage_daily = d.get("usage_daily", 0)
-        # limit_usd: credit limit on the account (0 if not set / free tier)
-        limit_usd = float(d.get("limit", 0) or 0)
-        remaining_usd = round(max(0.0, limit_usd - float(usage_total)), 4) if limit_usd else None
+        # limit is None for postpaid/unlimited keys; 0 or a float for prepaid keys
+        limit_usd = d.get("limit")
+        if limit_usd is not None:
+            limit_usd = float(limit_usd)
+            remaining_usd = round(max(0.0, limit_usd - float(usage_total)), 4)
+            is_available = remaining_usd > 0
+        else:
+            # Unlimited/postpaid key — always available
+            remaining_usd = 999999.0
+            is_available = True
         result = {
             "total_usd": float(usage_total),
             "daily_usd": float(usage_daily),
+            "remaining_usd": remaining_usd,
         }
-        if limit_usd:
+        if limit_usd is not None:
             result["limit_usd"] = limit_usd
-        if remaining_usd is not None:
-            result["remaining_usd"] = remaining_usd
-        # If balance > 0 — reset the "payment failed" flag so OpenRouter is tried again
-        if remaining_usd and remaining_usd > 0:
+        # Reset payment failed flag if key is available
+        if is_available:
             try:
                 import ouroboros.llm as _llm_mod
                 if _llm_mod._openrouter_payment_failed:
                     _llm_mod._openrouter_payment_failed = False
-                    log.info("OpenRouter balance restored (%.4f USD) — re-enabling OpenRouter", remaining_usd)
+                    log.info("OpenRouter available (remaining=%.4f USD) — re-enabling OpenRouter", remaining_usd)
             except Exception:
                 pass
         return result

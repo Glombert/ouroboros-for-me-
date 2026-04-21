@@ -364,6 +364,29 @@ def _call_google_direct(
 # Main LLM client
 # ---------------------------------------------------------------------------
 
+def _init_payment_flag_from_state() -> None:
+    """Read persisted openrouter_remaining_usd from state.json.
+    If it's 0.0, pre-emptively set _openrouter_payment_failed=True
+    so we don't waste 3 retry attempts on a dead provider at startup.
+    """
+    global _openrouter_payment_failed
+    if _openrouter_payment_failed:
+        return  # already set
+    try:
+        import json
+        drive_root = os.environ.get("DRIVE_ROOT", "/content/drive/MyDrive/Ouroboros")
+        state_path = os.path.join(drive_root, "state", "state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                st = json.load(f)
+            remaining = st.get("openrouter_remaining_usd")
+            if remaining is not None and float(remaining) <= 0.0:
+                _openrouter_payment_failed = True
+                log.info("Loaded state: OpenRouter balance=%.4f — starting in direct-API mode", float(remaining))
+    except Exception:
+        pass  # non-critical, just don't set the flag
+
+
 class LLMClient:
     """OpenRouter API wrapper with direct API fallback."""
 
@@ -375,6 +398,8 @@ class LLMClient:
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._base_url = base_url
         self._client = None
+        # Initialize payment flag from persisted state
+        _init_payment_flag_from_state()
 
     def _get_client(self):
         if self._client is None:
