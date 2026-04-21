@@ -11,7 +11,6 @@ from multiprocessing import Queue
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from supervisor.git_ops import git_pull, git_status
 from supervisor.queue import enqueue_task, _queue_lock
 from supervisor.state import DRIVE_ROOT, append_jsonl, load_state, save_state
 from supervisor.telegram import get_tg
