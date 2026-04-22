@@ -1,7 +1,8 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter).
+Communicates with LLM APIs: OpenRouter (primary), with direct API fallback
+when OpenRouter is unavailable (e.g. insufficient credits).
 Contract: chat(), default_model(), available_models(), add_usage().
 """
 
@@ -14,7 +15,30 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_LIGHT_MODEL = "google/gemini-2.0-flash"
+
+# Model name mapping: OpenRouter model IDs → direct provider model IDs
+_OPENROUTER_TO_ANTHROPIC: Dict[str, str] = {
+    "anthropic/claude-sonnet-4.6": "claude-sonnet-4-5",
+    "anthropic/claude-opus-4.6": "claude-opus-4-5",
+    "anthropic/claude-opus-4.7": "claude-opus-4-5",
+    "anthropic/claude-haiku-4.6": "claude-haiku-4-5",
+    "anthropic/claude-3-5-sonnet-20241022": "claude-3-5-sonnet-20241022",
+    "anthropic/claude-3-5-haiku-20241022": "claude-3-5-haiku-20241022",
+}
+
+_OPENROUTER_TO_DEEPSEEK: Dict[str, str] = {
+    "deepseek/deepseek-chat": "deepseek-chat",
+    "deepseek/deepseek-coder": "deepseek-coder",
+    "deepseek/deepseek-r1": "deepseek-reasoner",
+}
+
+_OPENROUTER_TO_GOOGLE: Dict[str, str] = {
+    "google/gemini-2.5-pro-preview": "gemini-2.5-pro-preview",
+    "google/gemini-2.0-flash": "gemini-2.0-flash",
+    "google/gemini-flash-1.5": "gemini-1.5-flash",
+    "google/gemini-3-pro-preview": "gemini-2.0-flash",  # non-existent → fallback
+}
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -103,7 +127,7 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """LLM client: OpenRouter primary, direct API fallback on failure."""
 
     def __init__(
         self,
@@ -151,6 +175,117 @@ class LLMClient:
             pass
         return None
 
+    def _resolve_direct_model(self, openrouter_model: str) -> Dict[str, str]:
+        """
+        Given an OpenRouter model name, return mapping of provider → direct model name.
+        Returns dict like {"anthropic": "claude-sonnet-4-5", "google": "gemini-2.0-flash", ...}
+        Only includes providers that have a known mapping.
+        """
+        result = {}
+
+        # Check explicit maps first
+        if openrouter_model in _OPENROUTER_TO_ANTHROPIC:
+            result["anthropic"] = _OPENROUTER_TO_ANTHROPIC[openrouter_model]
+        elif openrouter_model.startswith("anthropic/"):
+            result["anthropic"] = "claude-sonnet-4-5"  # default Anthropic model
+
+        if openrouter_model in _OPENROUTER_TO_DEEPSEEK:
+            result["deepseek"] = _OPENROUTER_TO_DEEPSEEK[openrouter_model]
+        elif openrouter_model.startswith("deepseek/"):
+            result["deepseek"] = "deepseek-chat"
+
+        if openrouter_model in _OPENROUTER_TO_GOOGLE:
+            result["google"] = _OPENROUTER_TO_GOOGLE[openrouter_model]
+        elif openrouter_model.startswith("google/"):
+            result["google"] = "gemini-2.0-flash"
+
+        # If no provider-specific match, add all available providers
+        # (prefer anthropic → deepseek → google order)
+        if not result:
+            result["anthropic"] = "claude-sonnet-4-5"
+            result["deepseek"] = "deepseek-chat"
+            result["google"] = "gemini-2.0-flash"
+
+        return result
+
+    def _call_direct_fallback(
+        self,
+        openrouter_model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        effort: str,
+        max_tokens: int,
+        tool_choice: str,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """
+        Try direct provider APIs when OpenRouter is unavailable.
+        Tries providers in priority order based on available API keys.
+        Returns (msg_dict, usage_dict) on success, raises last exception on total failure.
+        """
+        from openai import OpenAI
+
+        provider_map = self._resolve_direct_model(openrouter_model)
+
+        # Build ordered list of providers to try, based on available API keys
+        # Priority: Anthropic (best quality) → DeepSeek (good value) → Google (free tier)
+        providers_to_try = []
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        deepseek_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        google_key = os.environ.get("GOOGLE_API_KEY", "")
+
+        if anthropic_key and "anthropic" in provider_map:
+            providers_to_try.append(("anthropic", provider_map["anthropic"], anthropic_key,
+                                     "https://api.anthropic.com/v1"))
+        if deepseek_key and "deepseek" in provider_map:
+            providers_to_try.append(("deepseek", provider_map["deepseek"], deepseek_key,
+                                     "https://api.deepseek.com/v1"))
+        if google_key and "google" in provider_map:
+            providers_to_try.append(("google", provider_map["google"], google_key,
+                                     "https://generativelanguage.googleapis.com/v1beta/openai/"))
+
+        if not providers_to_try:
+            raise RuntimeError("No direct API keys available for fallback (ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GOOGLE_API_KEY)")
+
+        last_error: Optional[Exception] = None
+        for provider_name, direct_model, api_key, base_url in providers_to_try:
+            try:
+                log.warning("Trying direct %s API with model %s", provider_name, direct_model)
+                client = OpenAI(base_url=base_url, api_key=api_key)
+
+                kwargs: Dict[str, Any] = {
+                    "model": direct_model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                }
+                if tools:
+                    # Strip cache_control for direct APIs (not supported)
+                    clean_tools = []
+                    for t in tools:
+                        t_clean = {k: v for k, v in t.items() if k != "cache_control"}
+                        clean_tools.append(t_clean)
+                    kwargs["tools"] = clean_tools
+                    kwargs["tool_choice"] = tool_choice
+
+                resp = client.chat.completions.create(**kwargs)
+                resp_dict = resp.model_dump()
+                usage = resp_dict.get("usage") or {}
+                choices = resp_dict.get("choices") or [{}]
+                msg = (choices[0] if choices else {}).get("message") or {}
+
+                # Mark provider in usage for tracking
+                usage["provider"] = provider_name
+                usage["direct_api"] = True
+                log.info("Direct %s API fallback succeeded (model=%s)", provider_name, direct_model)
+                return msg, usage
+
+            except Exception as e:
+                log.warning("Direct %s API fallback failed: %s", provider_name, e)
+                last_error = e
+                continue
+
+        raise RuntimeError(f"All direct API providers failed. Last error: {last_error}")
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -160,7 +295,10 @@ class LLMClient:
         max_tokens: int = 16384,
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
+        """Single LLM call. Returns: (response_message_dict, usage_dict with cost).
+        
+        Primary: OpenRouter. Falls back to direct provider APIs on failure.
+        """
         client = self._get_client()
         effort = normalize_reasoning_effort(reasoning_effort)
 
@@ -193,7 +331,25 @@ class LLMClient:
             kwargs["tools"] = tools_with_cache
             kwargs["tool_choice"] = tool_choice
 
-        resp = client.chat.completions.create(**kwargs)
+        openrouter_error: Optional[Exception] = None
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            log.warning("OpenRouter failed (%s: %s), trying direct API fallback...",
+                        type(e).__name__, e)
+            openrouter_error = e
+
+        if openrouter_error is not None:
+            # Try direct provider APIs as fallback
+            return self._call_direct_fallback(
+                openrouter_model=model,
+                messages=messages,
+                tools=tools,
+                effort=effort,
+                max_tokens=max_tokens,
+                tool_choice=tool_choice,
+            )
+
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
         choices = resp_dict.get("choices") or [{}]
