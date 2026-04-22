@@ -284,7 +284,34 @@ class LLMClient:
                 last_error = e
                 continue
 
+        self._notify_all_providers_failed(model, last_error)
         raise RuntimeError(f"All direct API providers failed. Last error: {last_error}")
+
+
+    def _notify_all_providers_failed(self, model: str, error: Exception) -> None:
+        """Send Telegram alert when all LLM providers are exhausted."""
+        import os
+        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        owner_id = os.environ.get("TELEGRAM_OWNER_ID", "")
+        if not bot_token or not owner_id:
+            log.warning("Cannot send Telegram alert: env vars missing")
+            return
+        try:
+            import requests as _req
+            msg = (
+                "[MIRA OFFLINE] All LLM providers failed.\n"
+                "Model: " + str(model) + "\n"
+                "Error: " + str(error)[:200] + "\n"
+                "\nCheck balances: openrouter.ai / console.anthropic.com / platform.deepseek.com"
+            )
+            _req.post(
+                "https://api.telegram.org/bot" + bot_token + "/sendMessage",
+                json={"chat_id": owner_id, "text": msg},
+                timeout=10
+            )
+            log.info("Sent Telegram alert: all providers failed")
+        except Exception as tg_err:
+            log.warning("Failed to send Telegram alert: %s", tg_err)
 
     def chat(
         self,
